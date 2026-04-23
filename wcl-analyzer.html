@@ -2117,24 +2117,20 @@ function initTooltip() {
     if (d.overkill > 0)  rows.push(trow('Overkill',  `<span class="warn">${d.overkill.toLocaleString()}</span>`));
 
     // HP transition. `hpBeforePct`/`hpAfterPct` may be null for the first
-    // event in the window (no prior state). When we could derive an
-    // estimated max HP for the fight (see maxHpEstimate), we show actual
-    // HP pools alongside the percentages.
-    const fmtAbs = (a, m) => (a != null && m != null) ? `${a.toLocaleString()}/${m.toLocaleString()}` : null;
+    // event in the window (no prior state). When we could derive absolute
+    // HP pools, show those; otherwise fall back to percentages.
     const tag = (pct) => pct < 30 ? 'warn' : pct < 60 ? 'big' : '';
     if (d.hpBeforePct != null && d.hpAfterPct != null) {
-      const absLine = (d.hpBefore != null && d.hpAfter != null && d.hpMax != null)
-        ? `${fmtAbs(d.hpBefore, d.hpMax)} → ${fmtAbs(d.hpAfter, d.hpMax)}`
-        : null;
-      if (absLine) {
-        rows.push(trow('HP', `<span class="${tag(d.hpAfterPct)}">${absLine}</span>`));
+      const haveAbs = d.hpBefore != null && d.hpAfter != null;
+      if (haveAbs) {
+        rows.push(trow('HP', `<span class="${tag(d.hpAfterPct)}">${d.hpBefore.toLocaleString()} → ${d.hpAfter.toLocaleString()}</span>`));
         rows.push(trow('', `<span style="color:var(--parchment-faint);font-size:0.82em">(${d.hpBeforePct}% → ${d.hpAfterPct}%)</span>`));
       } else {
         rows.push(trow('HP', `<span class="${tag(d.hpAfterPct)}">${d.hpBeforePct}% → ${d.hpAfterPct}%</span>`));
       }
     } else if (d.hpAfterPct != null) {
-      if (d.hpAfter != null && d.hpMax != null) {
-        rows.push(trow('HP after', `<span class="${tag(d.hpAfterPct)}">${fmtAbs(d.hpAfter, d.hpMax)}</span>`));
+      if (d.hpAfter != null) {
+        rows.push(trow('HP after', `<span class="${tag(d.hpAfterPct)}">${d.hpAfter.toLocaleString()}</span>`));
         rows.push(trow('', `<span style="color:var(--parchment-faint);font-size:0.82em">(${d.hpAfterPct}%)</span>`));
       } else {
         rows.push(trow('HP after', `<span class="${tag(d.hpAfterPct)}">${d.hpAfterPct}%</span>`));
