@@ -2140,7 +2140,6 @@ function initTooltip() {
         rows.push(trow('HP after', `<span class="${tag(d.hpAfterPct)}">${d.hpAfterPct}%</span>`));
       }
     }
-    if (d.armor) rows.push(trow('Tank armor', d.armor.toLocaleString()));
     if (d.hpMax && d.hpBefore != null) {
       rows.push(`<div class="tt-meta">Tank max HP estimated from damage-event deltas.</div>`);
     }
