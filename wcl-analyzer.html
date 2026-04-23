@@ -957,6 +957,19 @@ function computeGearStats(wclGear) {
   const parryPct = total.parryRating / TBC.PARRY_RATING_PER_PCT;
   const blockPct = total.blockRating / TBC.BLOCK_RATING_PER_PCT;
 
+  // "Uncrushable" math — a level-70 tank vs a level-73 raid boss has 15%
+  // crush on the combat table. Total (miss + dodge + parry + block) must
+  // be ≥ 102.4% to push crushes off. Miss chance from defense skill
+  // approximates as 5% base + 0.04% per skill over 350 (the boss's skill
+  // is 365, and defense above 350 adds miss vs a +3-level target).
+  const baseMissPct = 5;
+  const defenseMissBonus = Math.max(0, defSkillOver * 0.04);
+  const missPct = baseMissPct + defenseMissBonus;
+  const avoidanceTotalPct = missPct + dodgePct + parryPct + blockPct;
+  const UNCRUSH_THRESHOLD = 102.4;
+  const deltaFromUncrushable = avoidanceTotalPct - UNCRUSH_THRESHOLD;
+  const uncrushable = deltaFromUncrushable >= 0;
+
   return {
     total,
     perSlot,
@@ -969,7 +982,11 @@ function computeGearStats(wclGear) {
       critReductionPct,
       deltaFromCritImmune,
       critImmune,
-      dodgePct, parryPct, blockPct,
+      uncrittable: critImmune,  // alias for clarity in the UI
+      dodgePct, parryPct, blockPct, missPct,
+      avoidanceTotalPct,
+      deltaFromUncrushable,
+      uncrushable,
       healthBonus: total.stamina * TBC.STAM_TO_HP,
     },
     missingEnchantSlots,
@@ -1490,19 +1507,27 @@ function renderGearPanel(fight, gearResult, prevGear) {
   titleEl.addEventListener('click', () => panel.classList.toggle('collapsed'));
   panel.appendChild(titleEl);
 
-  // Compact one-liner — only visible when collapsed. Keeps the crit-immune
-  // signal and core stats at a glance without spending vertical space on
-  // the full table.
-  const chip = (k, v, cls) =>
-    `<span class="chip"><span class="k">${escapeHTML(k)}</span><span class="v ${cls || ''}">${escapeHTML(v)}</span></span>`;
+  // Compact one-liner — only visible when collapsed. Leads with the two
+  // holy-grail TBC tank thresholds: uncrittable (def-skill-based crit
+  // immunity) and uncrushable (pushes crushing blows off the combat
+  // table). Each chip shows the actual % above/below its threshold.
+  const chip = (k, v, cls, titleAttr) =>
+    `<span class="chip"${titleAttr ? ` title="${escapeHTML(titleAttr)}"` : ''}><span class="k">${escapeHTML(k)}</span><span class="v ${cls || ''}">${escapeHTML(v)}</span></span>`;
+  const signPct = (v, digits=2) => (v >= 0 ? '+' : '') + v.toFixed(digits) + '%';
   const summaryLine = el('div', { className: 'gear-summary-line' });
   summaryLine.innerHTML = [
-    chip('Def', `${d.defSkill}`, d.critImmune ? 'good' : 'bad'),
-    chip('Crit imm', d.critImmune ? 'YES' : 'NO', d.critImmune ? 'good' : 'bad'),
+    chip('Def', `${d.defSkill}`),
+    chip('Uncrit',   `${d.uncrittable ? 'YES' : 'NO'} ${signPct(d.deltaFromCritImmune)}`,
+         d.uncrittable ? 'good' : 'bad',
+         `Crit reduction ${d.critReductionPct.toFixed(2)}% · need 5.60% vs level-73 boss`),
+    chip('Uncrush',  `${d.uncrushable  ? 'YES' : 'NO'} ${signPct(d.deltaFromUncrushable, 1)}`,
+         d.uncrushable ? 'good' : 'bad',
+         `Miss+Dodge+Parry+Block = ${d.avoidanceTotalPct.toFixed(1)}% · need 102.4%`),
     chip('Sta', String(gearResult.total.stamina)),
     chip('Dodge', `${d.dodgePct.toFixed(1)}%`),
     chip('Parry', `${d.parryPct.toFixed(1)}%`),
     chip('Block', `${d.blockPct.toFixed(1)}%`),
+    chip('Miss',  `${d.missPct.toFixed(1)}%`, '', 'Derived from defense vs lvl-73 boss'),
     chip('Armor', gearResult.total.armor.toLocaleString()),
     chip('SP', String(gearResult.total.spellPower)),
   ].join('');
@@ -1512,27 +1537,34 @@ function renderGearPanel(fight, gearResult, prevGear) {
   const details = el('div', { className: 'gear-details' });
   panel.appendChild(details);
 
-  // Stat strip
+  // Stat strip. The two holy-grail tank thresholds come first.
   const strip = el('div', { className: 'stat-strip' }, [
+    statCell('Uncrittable', d.uncrittable ? 'YES' : 'NO', {
+      delta: `${d.critReductionPct.toFixed(2)}% crit reduction · need 5.60%`,
+      good: d.uncrittable, bad: !d.uncrittable,
+    }),
+    statCell('Uncrushable', d.uncrushable ? 'YES' : 'NO', {
+      delta: `Miss+D+P+B = ${d.avoidanceTotalPct.toFixed(1)}% · need 102.4%`,
+      good: d.uncrushable, bad: !d.uncrushable,
+    }),
     statCell('Defense Skill', `${d.defSkill}`, {
       delta: `+${d.defSkillFromRating} from rating`,
-      good: d.critImmune, bad: !d.critImmune,
-    }),
-    statCell('Crit Immune?', d.critImmune ? 'YES' : 'NO', {
-      delta: `${d.deltaFromCritImmune >= 0 ? '+' : ''}${d.deltaFromCritImmune.toFixed(2)}% vs 5.6%`,
-      good: d.critImmune, bad: !d.critImmune,
+      good: d.uncrittable, bad: !d.uncrittable,
     }),
     statCell('Stamina', gearResult.total.stamina.toString(), {
       delta: `~${d.healthBonus.toLocaleString()} HP`,
-    }),
-    statCell('Block', `${d.blockPct.toFixed(2)}%`, {
-      delta: `${gearResult.total.blockRating} rating`,
     }),
     statCell('Dodge', `${d.dodgePct.toFixed(2)}%`, {
       delta: `${gearResult.total.dodgeRating} rating`,
     }),
     statCell('Parry', `${d.parryPct.toFixed(2)}%`, {
       delta: `${gearResult.total.parryRating} rating`,
+    }),
+    statCell('Block', `${d.blockPct.toFixed(2)}%`, {
+      delta: `${gearResult.total.blockRating} rating`,
+    }),
+    statCell('Miss', `${d.missPct.toFixed(2)}%`, {
+      delta: `5% base + def bonus`,
     }),
     statCell('Block Value', gearResult.total.blockValue.toString()),
     statCell('Armor', gearResult.total.armor.toLocaleString()),
