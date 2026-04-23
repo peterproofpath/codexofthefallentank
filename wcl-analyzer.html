@@ -593,6 +593,58 @@ button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Make timeline SVG elements show a pointer cursor when hoverable. */
 .timeline-svg [data-evt] { cursor: help; }
+
+/* Collapsible gear panel. Default state is collapsed — a one-line summary
+   is shown, and clicking the title toggles the full details. */
+.gear-panel .panel-title {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  margin: 0;
+  padding: 0.15em 0;
+}
+.gear-panel .panel-title:hover { color: var(--gold-bright); }
+.gear-panel .chevron {
+  display: inline-block;
+  width: 0.8em;
+  text-align: center;
+  color: var(--gold-deep);
+  transition: transform 120ms ease-out, color 120ms;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+}
+.gear-panel .panel-title:hover .chevron { color: var(--gold); }
+.gear-panel.collapsed .chevron { transform: rotate(-90deg); }
+
+.gear-panel .gear-details { overflow: hidden; }
+.gear-panel.collapsed .gear-details { display: none; }
+
+.gear-panel .gear-summary-line {
+  display: none;
+  margin-top: 0.35rem;
+  padding: 0.55rem 0.9rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  color: var(--parchment-dim);
+  background: var(--velvet-3);
+  border: 1px solid var(--divider);
+  border-radius: 1px;
+}
+.gear-panel.collapsed .gear-summary-line { display: block; }
+.gear-panel .gear-summary-line .chip { margin-right: 1.1em; white-space: nowrap; }
+.gear-panel .gear-summary-line .chip .k {
+  color: var(--parchment-faint);
+  font-size: 0.72em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: 'Cinzel', serif;
+  margin-right: 0.35em;
+}
+.gear-panel .gear-summary-line .chip .v { color: var(--parchment); }
+.gear-panel .gear-summary-line .chip .v.good { color: #a8d48a; }
+.gear-panel .gear-summary-line .chip .v.bad  { color: var(--blood-bright); }
 </style>
 </head>
 <body>
@@ -1363,8 +1415,39 @@ function statCell(k, v, extra) {
 
 function renderGearPanel(fight, gearResult, prevGear) {
   const d = gearResult.derived;
-  const panel = el('section', { className: 'panel' });
-  panel.appendChild(el('h4', { className: 'panel-title' }, ['Gear Breakdown']));
+  // `panel gear-panel collapsed` — the collapsed class is the default. Click
+  // on the title toggles it.
+  const panel = el('section', { className: 'panel gear-panel collapsed' });
+
+  const chevron = el('span', { className: 'chevron' }, ['▾']);
+  const titleEl = el('h4', {
+    className: 'panel-title',
+    title: 'Click to expand gear details',
+  }, [chevron, 'Gear Breakdown']);
+  titleEl.addEventListener('click', () => panel.classList.toggle('collapsed'));
+  panel.appendChild(titleEl);
+
+  // Compact one-liner — only visible when collapsed. Keeps the crit-immune
+  // signal and core stats at a glance without spending vertical space on
+  // the full table.
+  const chip = (k, v, cls) =>
+    `<span class="chip"><span class="k">${escapeHTML(k)}</span><span class="v ${cls || ''}">${escapeHTML(v)}</span></span>`;
+  const summaryLine = el('div', { className: 'gear-summary-line' });
+  summaryLine.innerHTML = [
+    chip('Def', `${d.defSkill}`, d.critImmune ? 'good' : 'bad'),
+    chip('Crit imm', d.critImmune ? 'YES' : 'NO', d.critImmune ? 'good' : 'bad'),
+    chip('Sta', String(gearResult.total.stamina)),
+    chip('Dodge', `${d.dodgePct.toFixed(1)}%`),
+    chip('Parry', `${d.parryPct.toFixed(1)}%`),
+    chip('Block', `${d.blockPct.toFixed(1)}%`),
+    chip('Armor', gearResult.total.armor.toLocaleString()),
+    chip('SP', String(gearResult.total.spellPower)),
+  ].join('');
+  panel.appendChild(summaryLine);
+
+  // Everything below here is collapsible.
+  const details = el('div', { className: 'gear-details' });
+  panel.appendChild(details);
 
   // Stat strip
   const strip = el('div', { className: 'stat-strip' }, [
@@ -1395,7 +1478,7 @@ function renderGearPanel(fight, gearResult, prevGear) {
       delta: `${(gearResult.total.resilience / TBC.RESIL_RATING_PER_PCT_CRIT).toFixed(2)}% crit`,
     }),
   ]);
-  panel.appendChild(strip);
+  details.appendChild(strip);
 
   // Gear table
   const table = el('table', { className: 'gear-table' });
@@ -1451,7 +1534,7 @@ function renderGearPanel(fight, gearResult, prevGear) {
     tbody.appendChild(tr);
   }
   table.appendChild(tbody);
-  panel.appendChild(table);
+  details.appendChild(table);
 
   // Set bonuses
   if (Object.keys(gearResult.setCounts).length) {
@@ -1473,7 +1556,7 @@ function renderGearPanel(fight, gearResult, prevGear) {
       }
       setDiv.appendChild(row);
     }
-    if (setDiv.children.length > 1) panel.appendChild(setDiv);
+    if (setDiv.children.length > 1) details.appendChild(setDiv);
   }
 
   // Gear diff vs previous fight
@@ -1492,22 +1575,22 @@ function renderGearPanel(fight, gearResult, prevGear) {
       }
     }
     diffDiv.innerHTML = `Swaps from previous fight: ${parts.join(', ')}`;
-    panel.appendChild(diffDiv);
+    details.appendChild(diffDiv);
   } else if (diff.first) {
     const diffDiv = el('div', { className: 'gear-diff' });
     diffDiv.innerHTML = `<span class="diff-none">First fight of the night — no prior gear to compare.</span>`;
-    panel.appendChild(diffDiv);
+    details.appendChild(diffDiv);
   } else {
     const diffDiv = el('div', { className: 'gear-diff' });
     diffDiv.innerHTML = `<span class="diff-none">No gear swaps from previous fight.</span>`;
-    panel.appendChild(diffDiv);
+    details.appendChild(diffDiv);
   }
 
   // Missing enchants warning
   if (gearResult.missingEnchantSlots.length) {
     const warn = el('div', { className: 'gear-diff', style: 'border-left-color: var(--blood-dim); color: var(--blood-bright);' });
     warn.textContent = `Missing enchants on: ${gearResult.missingEnchantSlots.join(', ')}.`;
-    panel.appendChild(warn);
+    details.appendChild(warn);
   }
 
   return panel;
