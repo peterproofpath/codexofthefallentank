@@ -24,11 +24,18 @@ their gear was appropriate for that boss. Built for TBC 2.4.3 / Karazhan
    - **Region** — defaults to `fresh` (Classic Fresh). Use `www` for retail, `classic` for era, `cata` for Cata Classic.
 3. Hit **Load Report**.
 
-Per-fight cards render along a vertical spine. For every fight the player
-was in, you get a gear breakdown with derived defense/crit-immunity numbers
-plus a "swaps from previous fight" diff. For every fight the player **died**
-in, you also get a 5-second death timeline (damage taken, healer casts,
-Holy Shield uptime) and a written autopsy.
+Per-fight cards render along a vertical spine. **Only fights where the
+tracked player actually died are shown** — this is a death analyzer, not a
+full raid dashboard. Each card includes a gear breakdown (with derived
+defense/crit-immunity numbers and a "swaps from previous fight" diff) plus
+a 10-second death timeline (damage taken, healer casts, Holy Shield
+uptime), and a written autopsy per death. Hover any damage tick, healer
+cast, or Holy Shield marker for a rich tooltip with hit type, mitigation,
+overkill, HP after hit, target, and segment duration.
+
+The timeline window is defined by a single constant (`TIMELINE_WINDOW_MS`
+at the top of the `<script>` block) — change it to 5000 or 15000 if you
+want a different forensic window.
 
 ### Caching
 
@@ -142,5 +149,5 @@ works:
   Classic TBC and is approximate.
 - Death events fired by WCL inside a fight but after the tank's actual
   killing blow (e.g. release → re-die from AOE ticks, or log noise from a
-  wipe) appear as successive deaths with 0 damage in the 5s window —
+  wipe) appear as successive deaths with 0 damage in the death window —
   those autopsies are correctly terse, not a bug.

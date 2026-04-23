@@ -526,6 +526,73 @@ button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
   .spine { display: none; }
   .fight-card .medallion { display: none; }
 }
+
+/* Hover tooltip for timeline SVG events */
+.tt {
+  position: fixed;
+  pointer-events: none;
+  z-index: 1000;
+  min-width: 220px;
+  max-width: 380px;
+  background: linear-gradient(180deg, #1a1613 0%, #0a0807 100%);
+  border: 1px solid var(--gold-deep);
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.6), 0 8px 24px -4px rgba(0,0,0,0.85);
+  padding: 0.6rem 0.85rem 0.7rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--parchment);
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 110ms ease-out, transform 110ms ease-out;
+}
+.tt.show { opacity: 1; transform: translateY(0); }
+.tt .tt-title {
+  font-family: 'Cinzel', serif;
+  color: var(--gold-bright);
+  font-size: 0.98rem;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.45rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--gold-deep);
+}
+.tt .tt-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.4em;
+  margin: 0.12em 0;
+}
+.tt .tt-k { color: var(--parchment-faint); }
+.tt .tt-v { color: var(--parchment); text-align: right; }
+.tt .tt-v.big { color: var(--gold); font-weight: 500; }
+.tt .tt-v.crit { color: var(--blood-bright); font-weight: 500; }
+.tt .tt-v.miss { color: #8a9a9a; font-style: italic; }
+.tt .tt-v.warn { color: var(--blood-bright); }
+.tt .tt-v.good { color: #a8d48a; }
+.tt .tt-v.heal { color: var(--holy-warm); }
+.tt .tt-meta {
+  color: var(--parchment-faint);
+  font-size: 0.76em;
+  font-style: italic;
+  margin-top: 0.45em;
+  padding-top: 0.35em;
+  border-top: 1px dashed var(--divider);
+  font-family: 'EB Garamond', serif;
+}
+.tt-hit-pill {
+  display: inline-block;
+  font-size: 0.72em;
+  padding: 0.08em 0.5em;
+  border: 1px solid currentColor;
+  border-radius: 1px;
+  margin-left: 0.4em;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+/* Make timeline SVG elements show a pointer cursor when hoverable. */
+.timeline-svg [data-evt] { cursor: help; }
 </style>
 </head>
 <body>
@@ -604,6 +671,10 @@ const WCL_SLOTS = [
   'Back','Main Hand','Off Hand','Ranged','Tabard',
 ];
 
+/* Death timeline window length. Events are fetched and rendered from
+ * deathTime − TIMELINE_WINDOW_MS up to deathTime. Change in one place. */
+const TIMELINE_WINDOW_MS = 10000;
+
 /* Region → V1 base URL. */
 function apiBase(region) { return `https://${region}.warcraftlogs.com/v1`; }
 
@@ -640,9 +711,11 @@ async function wclFetch(region, code, endpoint, params, onRetry) {
   if (netCache.has(key)) return netCache.get(key);
 
   const url = `${apiBase(region)}/report/${endpoint}?${qs}`;
-  let delay = 1000;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let delay = 1500;
+  for (let attempt = 0; attempt < 4; attempt++) {
     const r = await fetch(url);
+    // WCL returns 429 either as HTTP status OR as HTTP 200 with {status:429,error}
+    // in the JSON body — handle both.
     if (r.status === 429) {
       if (onRetry) onRetry(attempt + 1);
       await new Promise(res => setTimeout(res, delay));
@@ -654,10 +727,19 @@ async function wclFetch(region, code, endpoint, params, onRetry) {
       throw new Error(`${r.status} ${r.statusText} — ${url}\n${txt.slice(0,300)}`);
     }
     const j = await r.json();
+    if (j && j.status === 429) {
+      if (onRetry) onRetry(attempt + 1);
+      await new Promise(res => setTimeout(res, delay));
+      delay *= 2;
+      continue;
+    }
+    if (j && j.status && j.error) {
+      throw new Error(`WCL error ${j.status}: ${j.error}`);
+    }
     netCache.set(key, j);
     return j;
   }
-  throw new Error(`Rate limited on ${endpoint} after retries`);
+  throw new Error(`Rate limited on ${endpoint} after retries — wait a minute and retry.`);
 }
 
 /* =========================================================================
@@ -829,7 +911,30 @@ function diffGear(prev, curr) {
 /* =========================================================================
  *  Death timeline — build SVG with 3 lanes
  * ========================================================================= */
-function buildDeathTimelineSVG({ damageEvents, healerCasts, holyShieldEvents, deathTime, playerId, windowMs = 5000 }) {
+// hitType codes (WCL V1 Classic). Verified empirically against Cassen's
+// Attumen damage-taken events in the reference report — type 15 = Crushing
+// Blow (the common tank killer vs level-73 bosses when not crit immune).
+const HIT_TYPE_NAME = {
+  0: 'Tick',              // ability events with no damage (knockdown, debuff, etc.)
+  1: 'Hit',
+  2: 'Crit',
+  3: 'Block',             // full block (rare on TBC bosses)
+  4: 'Blocked',           // partial block — hit lands with some amount blocked
+  5: 'Glance',
+  6: 'Absorb',
+  7: 'Miss',
+  8: 'Dodge',
+  10: 'Parry',
+  14: 'Immune',
+  15: 'Crush',            // 150% damage — only when target lacks crit immunity
+  16: 'Resist',
+  17: 'Reflect',
+};
+
+function buildDeathTimelineSVG({
+  damageEvents, healerCasts, holyShieldEvents,
+  deathTime, playerId, playerName, healerName, nameMap, windowMs = 10000,
+}) {
   const W = 1100, H = 210;
   const PAD_L = 56, PAD_R = 20, PAD_T = 22, PAD_B = 38;
   const innerW = W - PAD_L - PAD_R;
@@ -838,6 +943,9 @@ function buildDeathTimelineSVG({ damageEvents, healerCasts, holyShieldEvents, de
   const t0 = deathTime - windowMs;
 
   const x = t => PAD_L + ((t - t0) / windowMs) * innerW;
+  const nm = (id) => (id == null ? '—' : (nameMap?.get(id) || `id ${id}`));
+  // Inline-JSON-encoded data-evt attr: HTML-escape for safe attr embedding.
+  const de = (o) => escapeXML(JSON.stringify(o));
 
   // Pre-compute max damage for scaling
   let maxDmg = 1;
@@ -853,8 +961,11 @@ function buildDeathTimelineSVG({ damageEvents, healerCasts, holyShieldEvents, de
     parts.push(`<rect x="${PAD_L}" y="${PAD_T + i*laneH}" width="${innerW}" height="${laneH}" fill="${i%2?'#14110d':'#0f0d0b'}" stroke="#2a2219" stroke-width="0.5"/>`);
   }
 
-  // Vertical gridlines at every second
-  for (let s = -5; s <= 0; s++) {
+  // Vertical gridlines — dynamic step so a 5s timeline draws every second and
+  // a 10s timeline draws every 2 seconds (keeps label density consistent).
+  const windowSec = Math.round(windowMs / 1000);
+  const gridStep = windowSec <= 6 ? 1 : 2;
+  for (let s = -windowSec; s <= 0; s += gridStep) {
     const xv = x(deathTime + s*1000);
     parts.push(`<line x1="${xv}" y1="${PAD_T}" x2="${xv}" y2="${PAD_T + innerH}" stroke="#2a2219" stroke-width="0.5" stroke-dasharray="2,3"/>`);
     parts.push(`<text x="${xv}" y="${H - PAD_B + 14}" fill="#7a6f56" font-family="JetBrains Mono, monospace" font-size="10" text-anchor="middle">t${s}s</text>`);
@@ -871,66 +982,76 @@ function buildDeathTimelineSVG({ damageEvents, healerCasts, holyShieldEvents, de
   }
 
   /* Lane 1 — damage taken ------------------------------------------------ */
-  // hitType codes (WCL V1): 1 normal, 2 crit, 3 block, 4 partial-block-or-glance,
-  // 7 miss, 8 dodge, 14 parry, 16 absorb, 17 blocked-full
   const dmgBaseline = PAD_T + laneH;
+  const dmgLaneTop = PAD_T;
   for (const e of damageEvents) {
     const ts = e.timestamp;
     if (ts < t0 || ts > deathTime) continue;
     const xv = x(ts);
     const amount = +(e.amount || 0);
     const absorbed = +(e.absorbed || 0);
+    const blocked = +(e.blocked || 0);
+    const mitigated = +(e.mitigated || 0);
+    const unmitigated = +(e.unmitigatedAmount || 0);
     const total = amount + absorbed;
     const h = Math.max(4, (total / maxDmg) * (laneH - 10));
     const absH = total > 0 ? Math.min(h, (absorbed / total) * h) : 0;
     const redH = Math.max(0, h - absH);
-    const name = (e.ability?.name || 'Melee').replace(/&/g,'&amp;');
+    const name = (e.ability?.name || 'Melee');
     const hitType = e.hitType;
-    const isCrit = hitType === 2;
-    const isMiss = hitType === 7 || hitType === 8 || hitType === 14 || hitType === 17;
+    const isCrit = hitType === 2 || hitType === 15;  // crit or crushing blow
+    // "Avoided" = no damage landed and no absorb (dodge/parry/miss/immune/tick).
+    const isMiss = total === 0;
     const color = isMiss ? '#556' : isCrit ? '#e74c5c' : '#a8202a';
-    const titleTxt = `${name}\nt${((ts - deathTime)/1000).toFixed(2)}s\namount ${amount}${absorbed ? ' (abs ' + absorbed + ')' : ''}${e.overkill ? ' — overkill ' + e.overkill : ''}`;
-    parts.push(`<g><title>${escapeXML(titleTxt)}</title>`);
+    const data = {
+      kind: 'damage',
+      name, t: +((ts - deathTime)/1000).toFixed(3),
+      amount, absorbed, blocked, mitigated, unmitigated,
+      overkill: +(e.overkill || 0),
+      hitType, hitTypeName: HIT_TYPE_NAME[hitType] || `type ${hitType}`,
+      source: nm(e.sourceID),
+      hp: e.hitPoints, hpMax: e.maxHitPoints,
+      armor: e.armor,
+    };
     if (absH > 0) parts.push(`<rect x="${xv-2}" y="${dmgBaseline - h}" width="4" height="${absH}" fill="#6a5a3a" opacity="0.8"/>`);
     parts.push(`<rect x="${xv-2}" y="${dmgBaseline - h + absH}" width="4" height="${redH}" fill="${color}" opacity="0.92"/>`);
-    // Blood-splash tip
     if (!isMiss && total > 0) {
       parts.push(`<circle cx="${xv}" cy="${dmgBaseline - h + 1}" r="2" fill="${color}" opacity="0.85"/>`);
     }
-    parts.push(`</g>`);
+    // Wider transparent hit-target so tooltip hover is easy on narrow bars.
+    parts.push(`<rect x="${xv-6}" y="${dmgLaneTop}" width="12" height="${laneH}" fill="transparent" data-evt="${de(data)}"/>`);
   }
 
   /* Lane 2 — healer casts ------------------------------------------------ */
   const healY = PAD_T + laneH + laneH/2;
+  const healLaneTop = PAD_T + laneH;
   for (const c of healerCasts) {
     const ts = c.timestamp;
     if (ts < t0 || ts > deathTime) continue;
     const xv = x(ts);
     const onPlayer = c.targetID === playerId;
-    const name = (c.ability?.name || '?').replace(/&/g,'&amp;');
+    const name = c.ability?.name || '?';
     const h = laneH * 0.5;
     const color = onPlayer ? '#fff4d0' : '#6a7a5a';
-    const titleTxt = `${name}\nt${((ts - deathTime)/1000).toFixed(2)}s\ntarget ${onPlayer ? 'PLAYER' : (c.targetID ?? '—')}`;
-    parts.push(`<g><title>${escapeXML(titleTxt)}</title>`);
     parts.push(`<line x1="${xv}" y1="${healY - h/2}" x2="${xv}" y2="${healY + h/2}" stroke="${color}" stroke-width="${onPlayer?3:2}" opacity="${onPlayer?1:0.55}" stroke-linecap="round"/>`);
     if (onPlayer) {
-      // spark: 4-pointed star
       parts.push(`<path d="M${xv},${healY-h/2-3} L${xv+2},${healY-h/2} L${xv},${healY-h/2+3} L${xv-2},${healY-h/2} Z" fill="${color}"/>`);
     }
-    // Label first 3 chars above tick if there's room
-    parts.push(`<text x="${xv}" y="${healY - h/2 - 6}" fill="${onPlayer?'#fff4d0':'#7a6f56'}" font-family="JetBrains Mono, monospace" font-size="8" text-anchor="middle">${name.slice(0,9)}</text>`);
-    parts.push(`</g>`);
+    parts.push(`<text x="${xv}" y="${healY - h/2 - 6}" fill="${onPlayer?'#fff4d0':'#7a6f56'}" font-family="JetBrains Mono, monospace" font-size="8" text-anchor="middle">${escapeXML(name.slice(0,9))}</text>`);
+    const data = {
+      kind: 'cast',
+      name, t: +((ts - deathTime)/1000).toFixed(3),
+      source: healerName || nm(c.sourceID),
+      target: nm(c.targetID), onPlayer,
+    };
+    parts.push(`<rect x="${xv-6}" y="${healLaneTop}" width="12" height="${laneH}" fill="transparent" data-evt="${de(data)}"/>`);
   }
 
   /* Lane 3 — Holy Shield ribbon ----------------------------------------- */
   const hsY = PAD_T + 2*laneH;
   const hsH = laneH;
-  // Determine uptime segments in window from holyShieldEvents:
-  //   events are {timestamp, type: 'applybuff'|'refreshbuff'|'removebuff'|'applybuffstack'|'removebuffstack'}
   const segments = [];
   let active = null;
-  // Decide whether HS was already up at window start by looking at first event
-  // (if first event is remove/refresh, it was up before)
   const sorted = holyShieldEvents.slice().sort((a,b) => a.timestamp - b.timestamp);
   if (sorted.length) {
     const first = sorted[0];
@@ -941,21 +1062,28 @@ function buildDeathTimelineSVG({ damageEvents, healerCasts, holyShieldEvents, de
     if (e.type === 'applybuff') {
       if (active === null) active = t;
     } else if (e.type === 'refreshbuff') {
-      if (active === null) active = t; // was up, still up — fall through
+      if (active === null) active = t;
     } else if (e.type === 'removebuff') {
       if (active !== null) { segments.push([active, t]); active = null; }
     }
   }
   if (active !== null) segments.push([active, deathTime]);
 
-  // Draw empty ribbon baseline
+  // Empty ribbon baseline (not hoverable — it's the "no-buff" floor).
   parts.push(`<rect x="${PAD_L}" y="${hsY + hsH*0.35}" width="${innerW}" height="${hsH*0.3}" fill="none" stroke="#3a2e1a" stroke-width="1" stroke-dasharray="2,3"/>`);
-  // Gilded segments
+  // Gilded uptime segments — hoverable with duration summary.
   for (const [a,b] of segments) {
     const xa = x(a), xb = x(b);
-    parts.push(`<rect x="${xa}" y="${hsY + hsH*0.3}" width="${xb - xa}" height="${hsH*0.4}" fill="url(#gild)" opacity="0.9"/>`);
+    const segData = {
+      kind: 'hs-segment',
+      startT: +((a - deathTime)/1000).toFixed(3),
+      endT:   +((b - deathTime)/1000).toFixed(3),
+      durationS: +((b - a)/1000).toFixed(2),
+      clipped: a === t0 ? 'start' : null,
+    };
+    parts.push(`<rect x="${xa}" y="${hsY + hsH*0.3}" width="${xb - xa}" height="${hsH*0.4}" fill="url(#gild)" opacity="0.9" data-evt="${de(segData)}"/>`);
   }
-  // Apply/refresh markers
+  // Apply/refresh/remove markers — each gets a generous invisible hit rect.
   for (const e of sorted) {
     if (e.timestamp < t0 || e.timestamp > deathTime) continue;
     const xv = x(e.timestamp);
@@ -963,7 +1091,14 @@ function buildDeathTimelineSVG({ damageEvents, healerCasts, holyShieldEvents, de
     const shape = e.type === 'removebuff'
       ? `<line x1="${xv}" y1="${hsY + hsH*0.25}" x2="${xv}" y2="${hsY + hsH*0.75}" stroke="${mColor}" stroke-width="2"/>`
       : `<circle cx="${xv}" cy="${hsY + hsH*0.5}" r="3" fill="${mColor}"/>`;
-    parts.push(`<g><title>Holy Shield ${e.type} at t${((e.timestamp - deathTime)/1000).toFixed(2)}s</title>${shape}</g>`);
+    parts.push(shape);
+    const markerData = {
+      kind: 'hs-marker',
+      type: e.type,
+      t: +((e.timestamp - deathTime)/1000).toFixed(3),
+      stack: e.stack,
+    };
+    parts.push(`<rect x="${xv-6}" y="${hsY}" width="12" height="${hsH}" fill="transparent" data-evt="${de(markerData)}"/>`);
   }
 
   /* Death moment — skull at t=0 ----------------------------------------- */
@@ -996,8 +1131,9 @@ function escapeXML(s) {
 /* =========================================================================
  *  Autopsy text generator
  * ========================================================================= */
-function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvents, healerCasts, holyShieldEvents, playerId }) {
-  const window = 5000;
+function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvents, healerCasts, holyShieldEvents, playerId, windowMs = 10000 }) {
+  const window = windowMs;
+  const windowSec = Math.round(window / 1000);
   const t0 = deathTime - window;
   const inWindow = (ts) => ts >= t0 && ts <= deathTime;
 
@@ -1068,13 +1204,13 @@ function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvent
   // Compose prose
   const parts = [];
   parts.push(`Died at <strong>${mmss}</strong> into the pull on <strong>${fight.name}</strong> (death ${deathIndex + 1}).`);
-  parts.push(`Took <span class="num">${totalDmg.toLocaleString()}</span> damage in the final 5 seconds (<span class="num">${dtps}</span> DTPS)${totalAbsorb ? ` with <span class="num">${totalAbsorb.toLocaleString()}</span> absorbed` : ''}.`);
+  parts.push(`Took <span class="num">${totalDmg.toLocaleString()}</span> damage in the final ${windowSec} seconds (<span class="num">${dtps}</span> DTPS)${totalAbsorb ? ` with <span class="num">${totalAbsorb.toLocaleString()}</span> absorbed` : ''}.`);
 
   if (hsUpAtDeath) {
     parts.push(`Holy Shield was <span class="num">up</span> at the killing moment (<span class="num">${hsUptimePct}%</span> uptime in the window).`);
   } else if (lapsedAt !== null) {
     const lapseAgo = Math.abs(lapsedAt).toFixed(1);
-    parts.push(`Holy Shield <span class="warn">lapsed at t${lapsedAt.toFixed(1)}s</span> (${lapseAgo}s before death) and was not refreshed — <span class="num">${hsUptimePct}%</span> uptime in the 5s window.`);
+    parts.push(`Holy Shield <span class="warn">lapsed at t${lapsedAt.toFixed(1)}s</span> (${lapseAgo}s before death) and was not refreshed — <span class="num">${hsUptimePct}%</span> uptime in the ${windowSec}s window.`);
   } else if (sorted.length === 0) {
     parts.push(`<span class="warn">Holy Shield was not up at all</span> during the death window.`);
   } else {
@@ -1089,7 +1225,7 @@ function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvent
   } else if (notOnPlayer.length) {
     parts.push(`<span class="warn">Healer cast no spells on the player</span> in the death window — ${notOnPlayer.length} cast${notOnPlayer.length===1?'':'s'} went to other targets.`);
   } else {
-    parts.push(`<span class="warn">No healer activity</span> from the tracked healer during this 5s window.`);
+    parts.push(`<span class="warn">No healer activity</span> from the tracked healer during this ${windowSec}s window.`);
   }
 
   if (killingBlow) {
@@ -1306,7 +1442,7 @@ function renderGearPanel(fight, gearResult, prevGear) {
   return panel;
 }
 
-function renderDeathBlock(fight, death, idx, playerId, totalDeaths) {
+function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
   const block = el('div', { className: 'death-block' });
   const fightSec = (death.deathTime - fight.start_time) / 1000;
   block.appendChild(el('div', { className: 'death-header' }, [
@@ -1321,7 +1457,10 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths) {
     holyShieldEvents: death.holyShieldEvents,
     deathTime: death.deathTime,
     playerId,
-    windowMs: 5000,
+    playerName: ctx.playerName,
+    healerName: ctx.healerName,
+    nameMap: ctx.nameMap,
+    windowMs: TIMELINE_WINDOW_MS,
   });
   block.appendChild(wrap);
 
@@ -1335,7 +1474,7 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths) {
   ]));
 
   // Numeric summary
-  const win = 5000;
+  const win = TIMELINE_WINDOW_MS;
   const t0 = death.deathTime - win;
   const totalDmg = death.damageEvents.filter(e => e.timestamp >= t0 && e.timestamp <= death.deathTime).reduce((s,e) => s + (e.amount || 0), 0);
   const totalAbs = death.damageEvents.filter(e => e.timestamp >= t0 && e.timestamp <= death.deathTime).reduce((s,e) => s + (e.absorbed || 0), 0);
@@ -1360,11 +1499,12 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths) {
     if (g > maxHealGap) maxHealGap = g;
   }
 
+  const winSec = Math.round(win / 1000);
   const sum = el('div', { className: 'timeline-summary' }, [
-    el('div', {}, [el('span', { className: 'k' }, ['Total damage (5s) ']), el('br'), el('span', { className: 'v' }, [totalDmg.toLocaleString()])]),
+    el('div', {}, [el('span', { className: 'k' }, [`Total damage (${winSec}s) `]), el('br'), el('span', { className: 'v' }, [totalDmg.toLocaleString()])]),
     el('div', {}, [el('span', { className: 'k' }, ['DTPS ']), el('br'), el('span', { className: 'v' }, [dtps])]),
     el('div', {}, [el('span', { className: 'k' }, ['Absorbed ']), el('br'), el('span', { className: 'v' }, [totalAbs.toLocaleString()])]),
-    el('div', {}, [el('span', { className: 'k' }, ['Heals on player (5s) ']), el('br'), el('span', { className: 'v' + (healsOnPlayer.length ? '' : ' warn') }, [healsOnPlayer.length.toString()])]),
+    el('div', {}, [el('span', { className: 'k' }, [`Heals on player (${winSec}s) `]), el('br'), el('span', { className: 'v' + (healsOnPlayer.length ? '' : ' warn') }, [healsOnPlayer.length.toString()])]),
     el('div', {}, [el('span', { className: 'k' }, ['Holy Shield uptime ']), el('br'), el('span', { className: 'v' + (hsUp/win < 0.6 ? ' warn' : '') }, [`${Math.round(hsUp/win*100)}%`])]),
     el('div', {}, [el('span', { className: 'k' }, ['Longest heal gap ']), el('br'), el('span', { className: 'v' + (maxHealGap > 3000 ? ' warn' : '') }, [`${(maxHealGap/1000).toFixed(1)}s`])]),
   ]);
@@ -1381,13 +1521,14 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths) {
     healerCasts: death.healerCasts,
     holyShieldEvents: death.holyShieldEvents,
     playerId,
+    windowMs: win,
   });
   block.appendChild(autopsy);
 
   return block;
 }
 
-function renderFightCard(fight, gearResult, prevGear, deaths, playerId) {
+function renderFightCard(fight, gearResult, prevGear, deaths, playerId, ctx = {}) {
   const card = el('section', {
     className: 'fight-card' + (deaths.length ? ' died' : ''),
     id: `fight-${fight.id}`,
@@ -1414,7 +1555,7 @@ function renderFightCard(fight, gearResult, prevGear, deaths, playerId) {
     const deathsSection = el('section', { className: 'panel' });
     deathsSection.appendChild(el('h4', { className: 'panel-title' }, ['Death Timeline']));
     const list = el('div', { className: 'deaths-list' });
-    deaths.forEach((d, i) => list.appendChild(renderDeathBlock(fight, d, i, playerId, deaths.length)));
+    deaths.forEach((d, i) => list.appendChild(renderDeathBlock(fight, d, i, playerId, deaths.length, ctx)));
     deathsSection.appendChild(list);
     card.appendChild(deathsSection);
   } else {
@@ -1446,15 +1587,20 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
 
   // All fights containing player
   const playerFightIds = new Set((player.fights || []).map(f => f.id));
-  const relevantFights = fightsJson.fights.filter(f => playerFightIds.has(f.id) && f.boss && f.boss !== 0);
-  // Also include trash fights where player died — still useful post-mortem
-  const allFightsWithDeaths = new Set();
-  // Fetch all player deaths once
+
+  // Fetch all player deaths once. WCL V1 `targetid` is unreliable on the
+  // deaths endpoint too — use `filter=target.name=…` and then post-filter
+  // client-side on targetID as a belt-and-braces.
   log('Fetching death events…');
   const deathsJson = await wclFetch(region, code, `events/deaths/${code}`, {
-    start: 0, end: 999999999, targetid: player.id, api_key: key,
+    start: 0, end: 999999999,
+    filter: `target.name="${player.name}"`,
+    api_key: key,
   });
-  const allDeaths = deathsJson.events || [];
+  const allDeaths = (deathsJson.events || []).filter(d => d.targetID === player.id);
+
+  // Map deaths → fight id so we can list only fights where the player died.
+  const allFightsWithDeaths = new Set();
   for (const d of allDeaths) {
     for (const f of fightsJson.fights) {
       if (f.start_time <= d.timestamp && d.timestamp <= f.end_time) {
@@ -1464,13 +1610,14 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
     }
   }
 
-  // Also render fights where player died even if not boss
+  // Per user request: only show fights where the tracked player actually
+  // died. Boss fights where they survived are skipped — this is a death
+  // analyzer, not a full raid dashboard.
   const fightsToRender = fightsJson.fights.filter(f =>
-    playerFightIds.has(f.id) &&
-    ((f.boss && f.boss !== 0) || allFightsWithDeaths.has(f.id))
+    playerFightIds.has(f.id) && allFightsWithDeaths.has(f.id)
   );
 
-  log(`Analyzing ${fightsToRender.length} fight${fightsToRender.length===1?'':'s'}…`);
+  log(`Analyzing ${fightsToRender.length} fight${fightsToRender.length===1?'':'s'} with deaths…`);
 
   // Fetch per-fight summary (gear) for each fight — in parallel
   const summaryPromises = fightsToRender.map(f => wclFetch(region, code, `tables/summary/${code}`, {
@@ -1482,7 +1629,7 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
   // events). We use `filter=target.name="…"` instead, then belt-and-braces
   // post-filter client-side on targetID.
   log(`Fetching death windows (${allDeaths.length} deaths)…`);
-  const windowMs = 5000;
+  const windowMs = TIMELINE_WINDOW_MS;
   const targetNameFilter = `target.name="${player.name}"`;
   const deathWindowPromises = allDeaths.map(d => {
     const start = d.timestamp - windowMs;
@@ -1609,9 +1756,21 @@ async function run() {
   }
 }
 
+function buildNameMap(fightsJson) {
+  const m = new Map();
+  for (const f of fightsJson.friendlies || []) m.set(f.id, f.name);
+  for (const f of fightsJson.friendlyPets || []) m.set(f.id, f.name);
+  for (const e of fightsJson.enemies || []) m.set(e.id, e.name);
+  for (const p of fightsJson.enemyPets || []) m.set(p.id, p.name);
+  return m;
+}
+
 function renderResults({ fightsJson, player, healer, fightData }) {
   const results = $('#results');
   results.innerHTML = '';
+
+  const nameMap = buildNameMap(fightsJson);
+  const ctx = { nameMap, playerName: player.name, healerName: healer.name };
 
   // Header
   const start = new Date(fightsJson.start);
@@ -1642,10 +1801,148 @@ function renderResults({ fightsJson, player, healer, fightData }) {
   let prevGear = null;
   for (const { fight, gear, deaths } of fightData) {
     const gearResult = computeGearStats(gear);
-    spine.appendChild(renderFightCard(fight, gearResult, prevGear, deaths, player.id));
+    spine.appendChild(renderFightCard(fight, gearResult, prevGear, deaths, player.id, ctx));
     prevGear = gear;
   }
   results.appendChild(spine);
+}
+
+/* =========================================================================
+ *  Timeline tooltip — delegated pointer listener that reads data-evt JSON
+ *  from any hovered SVG element and renders a themed card next to the cursor.
+ * ========================================================================= */
+function initTooltip() {
+  const tt = document.createElement('div');
+  tt.className = 'tt';
+  tt.setAttribute('role', 'tooltip');
+  tt.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(tt);
+
+  const GAP = 14;
+  function position(x, y) {
+    // Offset cursor, then clamp to viewport.
+    const r = tt.getBoundingClientRect();
+    let px = x + GAP;
+    let py = y + GAP;
+    if (px + r.width  > window.innerWidth  - 6) px = x - r.width  - GAP;
+    if (py + r.height > window.innerHeight - 6) py = y - r.height - GAP;
+    if (px < 6) px = 6;
+    if (py < 6) py = 6;
+    tt.style.left = px + 'px';
+    tt.style.top  = py + 'px';
+  }
+
+  function rowsForDamage(d) {
+    const rows = [];
+    const hit = d.hitTypeName || '';
+    const landed = (d.amount > 0 || d.absorbed > 0);
+    // Pill color: red for crit/crush, gray for avoided, gold for plain hits.
+    const hitPillClass = (d.hitType === 2 || d.hitType === 15) ? 'crit'
+                      : !landed ? 'miss'
+                      : 'big';
+    const title = `${escapeHTML(d.name)} <span class="tt-hit-pill ${hitPillClass}">${escapeHTML(hit)}</span>`;
+    rows.push(`<div class="tt-title">${title}</div>`);
+    const sign = d.t > 0 ? '+' : '';
+    rows.push(trow('Time', `${sign}${d.t.toFixed(2)}s before death`));
+    rows.push(trow('Source', escapeHTML(d.source)));
+    if (d.amount > 0 || d.absorbed > 0) {
+      rows.push(trow('Damage taken', `<span class="big">${d.amount.toLocaleString()}</span>`));
+    }
+    if (d.absorbed > 0)  rows.push(trow('Absorbed',  `<span class="good">${d.absorbed.toLocaleString()}</span>`));
+    if (d.blocked  > 0)  rows.push(trow('Blocked',   `<span class="good">${d.blocked.toLocaleString()}</span>`));
+    if (d.mitigated > 0) rows.push(trow('Mitigated', d.mitigated.toLocaleString()));
+    if (d.unmitigated > 0 && d.unmitigated !== d.amount) rows.push(trow('Unmitigated', d.unmitigated.toLocaleString()));
+    if (d.overkill > 0)  rows.push(trow('Overkill',  `<span class="warn">${d.overkill.toLocaleString()}</span>`));
+    if (d.hp != null && d.hpMax != null) {
+      rows.push(trow('HP after', `${d.hp}/${d.hpMax}`));
+    }
+    if (d.armor) rows.push(trow('Tank armor', d.armor.toLocaleString()));
+    return rows.join('');
+  }
+  function rowsForCast(c) {
+    const rows = [];
+    rows.push(`<div class="tt-title">${escapeHTML(c.name)}</div>`);
+    const sign = c.t > 0 ? '+' : '';
+    rows.push(trow('Time', `${sign}${c.t.toFixed(2)}s before death`));
+    rows.push(trow('Source', escapeHTML(c.source || '—')));
+    rows.push(trow('Target', `<span class="${c.onPlayer ? 'heal' : ''}">${escapeHTML(c.target)}</span>`));
+    if (c.onPlayer) rows.push(`<div class="tt-meta">Landed on the tracked tank.</div>`);
+    else rows.push(`<div class="tt-meta">Went to another target — not counted as a tank heal.</div>`);
+    return rows.join('');
+  }
+  function rowsForHsMarker(m) {
+    const label = m.type === 'applybuff'   ? 'Holy Shield Applied'
+                : m.type === 'refreshbuff' ? 'Holy Shield Refreshed'
+                : m.type === 'removebuff'  ? 'Holy Shield Faded'
+                : `Holy Shield ${m.type}`;
+    const rows = [];
+    rows.push(`<div class="tt-title">${label}</div>`);
+    const sign = m.t > 0 ? '+' : '';
+    rows.push(trow('Time', `${sign}${m.t.toFixed(2)}s before death`));
+    if (m.stack) rows.push(trow('Charges', String(m.stack)));
+    if (m.type === 'removebuff') rows.push(`<div class="tt-meta">Buff ended — tank is no longer blocking extra hits.</div>`);
+    if (m.type === 'applybuff')  rows.push(`<div class="tt-meta">Fresh cast — 10s / 8 charge window begins.</div>`);
+    if (m.type === 'refreshbuff')rows.push(`<div class="tt-meta">Recast while active — window reset.</div>`);
+    return rows.join('');
+  }
+  function rowsForHsSegment(s) {
+    const rows = [];
+    rows.push(`<div class="tt-title">Holy Shield uptime</div>`);
+    const sig = v => (v > 0 ? '+' : '') + v.toFixed(2) + 's';
+    rows.push(trow('Window', `${sig(s.startT)} → ${sig(s.endT)}`));
+    rows.push(trow('Duration', `<span class="good">${s.durationS.toFixed(2)}s</span>`));
+    if (s.clipped === 'start') rows.push(`<div class="tt-meta">Was already active when the ${windowSec}s window began.</div>`);
+    return rows.join('');
+  }
+  function trow(k, v) {
+    return `<div class="tt-row"><span class="tt-k">${escapeHTML(k)}</span><span class="tt-v">${v}</span></div>`;
+  }
+
+  function render(data) {
+    if (data.kind === 'damage')      return rowsForDamage(data);
+    if (data.kind === 'cast')        return rowsForCast(data);
+    if (data.kind === 'hs-marker')   return rowsForHsMarker(data);
+    if (data.kind === 'hs-segment')  return rowsForHsSegment(data);
+    return `<div class="tt-title">Unknown</div>`;
+  }
+
+  let currentEl = null;
+  function handleMove(ev) {
+    // ev.target can be any DOM node; `closest` walks up including SVG parents.
+    const t = ev.target && ev.target.closest && ev.target.closest('[data-evt]');
+    if (!t) {
+      if (currentEl) { tt.classList.remove('show'); tt.setAttribute('aria-hidden','true'); currentEl = null; }
+      return;
+    }
+    if (t !== currentEl) {
+      currentEl = t;
+      try {
+        const data = JSON.parse(t.getAttribute('data-evt'));
+        tt.innerHTML = render(data);
+        tt.classList.add('show');
+        tt.setAttribute('aria-hidden','false');
+      } catch (e) {
+        tt.classList.remove('show');
+        currentEl = null;
+        return;
+      }
+    }
+    position(ev.clientX, ev.clientY);
+  }
+  document.addEventListener('mousemove', handleMove, { passive: true });
+  document.addEventListener('mouseleave', () => {
+    tt.classList.remove('show');
+    tt.setAttribute('aria-hidden','true');
+    currentEl = null;
+  });
+  // Hide on scroll — stale tooltip positions look bad.
+  window.addEventListener('scroll', () => {
+    if (currentEl) { tt.classList.remove('show'); currentEl = null; }
+  }, { passive: true });
+}
+
+function escapeHTML(s) {
+  return String(s ?? '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 /* =========================================================================
@@ -1656,6 +1953,7 @@ function boot() {
   indexDB(ITEMS_DB);
 
   loadForm();
+  initTooltip();
   $('#go').addEventListener('click', run);
   $('#f').addEventListener('submit', e => { e.preventDefault(); run(); });
   $('#clear-cache').addEventListener('click', () => {
