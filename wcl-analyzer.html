@@ -1181,14 +1181,12 @@ function buildDeathTimelineSVG({
   /* Lane 2 — heals on tank (all sources) ------------------------------ */
   // Every landed heal tick from any healer in the raid. Bar height scales
   // with effective heal size so a Greater Heal stands out from a Renew
-  // tick. Crit heals get a brighter gold. Hover shows the specific source
-  // + ability + effective / overheal / total.
+  // tick. Hover shows the specific source + ability + effective / overheal.
   let maxHealAmt = 1;
   for (const he of healingReceived) {
     const amt = +(he.amount || 0);
     if (amt > maxHealAmt) maxHealAmt = amt;
   }
-  const healY = PAD_T + laneH + laneH/2;
   const healLaneTop = PAD_T + laneH;
   const healBaseline = PAD_T + 2*laneH;
   for (const he of healingReceived) {
@@ -1197,15 +1195,9 @@ function buildDeathTimelineSVG({
     const xv = x(ts);
     const amount = +(he.amount || 0);
     const overheal = +(he.overheal || 0);
-    const isCrit = he.hitType === 2;
     const h = Math.max(4, (amount / maxHealAmt) * (laneH - 10));
-    const color = isCrit ? '#ffe9a8' : '#fff4d0';
     // Upward tick from baseline for heals (mirrors the downward dmg bars).
-    parts.push(`<rect x="${xv-2}" y="${healBaseline - h}" width="4" height="${h}" fill="${color}" opacity="0.92"/>`);
-    // Spark tip for crit heals.
-    if (isCrit) {
-      parts.push(`<path d="M${xv},${healBaseline-h-4} L${xv+2},${healBaseline-h-1} L${xv},${healBaseline-h+2} L${xv-2},${healBaseline-h-1} Z" fill="${color}"/>`);
-    }
+    parts.push(`<rect x="${xv-2}" y="${healBaseline - h}" width="4" height="${h}" fill="#fff4d0" opacity="0.92"/>`);
     const data = {
       kind: 'heal',
       name: he.ability?.name || 'Heal',
@@ -1213,7 +1205,6 @@ function buildDeathTimelineSVG({
       source: nm(he.sourceID),
       amount, overheal,
       total: amount + overheal,
-      crit: isCrit,
     };
     parts.push(`<rect x="${xv-6}" y="${healLaneTop}" width="12" height="${laneH}" fill="transparent" data-evt="${de(data)}"/>`);
   }
@@ -1695,7 +1686,6 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
     el('span', {}, [el('span', { className: 'dot', style: 'background:#e74c5c' }), 'crit/crush']),
     el('span', {}, [el('span', { className: 'dot', style: 'background:#6a5a3a' }), 'absorbed']),
     el('span', {}, [el('span', { className: 'dot', style: 'background:#fff4d0' }), 'heal landed']),
-    el('span', {}, [el('span', { className: 'dot', style: 'background:#ffe9a8' }), 'crit heal']),
     el('span', {}, [el('span', { className: 'dot', style: 'background:linear-gradient(180deg,#fff4d0,#8a6a1f)' }), 'Holy Shield up']),
   ]));
 
@@ -2137,8 +2127,7 @@ function initTooltip() {
   }
   function rowsForHeal(h) {
     const rows = [];
-    const titleBadge = h.crit ? ` <span class="tt-hit-pill crit">CRIT</span>` : '';
-    rows.push(`<div class="tt-title">${escapeHTML(h.name)}${titleBadge}</div>`);
+    rows.push(`<div class="tt-title">${escapeHTML(h.name)}</div>`);
     const sign = h.t > 0 ? '+' : '';
     rows.push(trow('Time', `${sign}${h.t.toFixed(2)}s before death`));
     rows.push(trow('Healer', escapeHTML(h.source || '—')));
