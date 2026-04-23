@@ -1045,9 +1045,9 @@ function buildDeathTimelineSVG({
   // HP trail. Merge damage + healing events in timestamp order so each
   // damage tooltip can show the tank's HP% both before and after the hit
   // even when a heal tick landed between two hits. WCL damage events carry
-  // hitPoints + maxHitPoints (often normalized to /100 in Classic); the
-  // ratio gives HP%. The "before" value for the first event in the window
-  // falls back to the prior event's "after", or null if none is known.
+  // hitPoints + maxHitPoints (normalized to /100 in Classic), so the ratio
+  // gives HP%. The "before" value for the first event in the window falls
+  // back to the prior event's "after", or null if none is known.
   const hpByDmgTs = new Map();   // dmg event timestamp → { before%, after% }
   {
     const ordered = []
@@ -1061,6 +1061,29 @@ function buildDeathTimelineSVG({
       const before = prev;
       if (e._kind === 'd') hpByDmgTs.set(e.timestamp, { before, after });
       prev = after != null ? after : prev;
+    }
+  }
+
+  // Estimate the tank's actual max HP from the damage events in this window.
+  // WCL normalizes hitPoints to a 0-100 scale, so raw HP pool isn't exposed
+  // directly — but amount / (hpBefore% - hpAfter%) × 100 recovers it. We
+  // collect per-event estimates from sizeable hits and take the median for
+  // robustness (single-hit estimates can be noisy from integer rounding).
+  let maxHpEstimate = null;
+  {
+    const samples = [];
+    for (const e of damageEvents) {
+      const amount = +(e.amount || 0);
+      if (amount < 400) continue;
+      const t = hpByDmgTs.get(e.timestamp);
+      if (!t || t.before == null || t.after == null) continue;
+      const deltaPct = t.before - t.after;
+      if (deltaPct < 2) continue;
+      samples.push(amount * 100 / deltaPct);
+    }
+    if (samples.length) {
+      samples.sort((a,b) => a - b);
+      maxHpEstimate = Math.round(samples[Math.floor(samples.length / 2)]);
     }
   }
 
@@ -1115,6 +1138,7 @@ function buildDeathTimelineSVG({
     const color = isMiss ? '#556' : isCrit ? '#e74c5c' : '#a8202a';
     const hpState = hpByDmgTs.get(ts) || {};
     const round1 = v => (v == null ? null : +v.toFixed(1));
+    const toAbs = (pct) => (pct == null || maxHpEstimate == null) ? null : Math.round(pct / 100 * maxHpEstimate);
     const data = {
       kind: 'damage',
       name, t: +((ts - deathTime)/1000).toFixed(3),
@@ -1124,6 +1148,9 @@ function buildDeathTimelineSVG({
       source: nm(e.sourceID),
       hpBeforePct: round1(hpState.before),
       hpAfterPct: round1(hpState.after),
+      hpBefore: toAbs(hpState.before),
+      hpAfter: toAbs(hpState.after),
+      hpMax: maxHpEstimate,
       armor: e.armor,
     };
     if (absH > 0) parts.push(`<rect x="${xv-2}" y="${dmgBaseline - h}" width="4" height="${absH}" fill="#6a5a3a" opacity="0.8"/>`);
@@ -2088,16 +2115,35 @@ function initTooltip() {
     if (d.mitigated > 0) rows.push(trow('Mitigated', d.mitigated.toLocaleString()));
     if (d.unmitigated > 0 && d.unmitigated !== d.amount) rows.push(trow('Unmitigated', d.unmitigated.toLocaleString()));
     if (d.overkill > 0)  rows.push(trow('Overkill',  `<span class="warn">${d.overkill.toLocaleString()}</span>`));
-    // HP transition. `hpBeforePct` may be null for the first event in the
-    // window (no prior state); in that case show just the resulting HP.
+
+    // HP transition. `hpBeforePct`/`hpAfterPct` may be null for the first
+    // event in the window (no prior state). When we could derive an
+    // estimated max HP for the fight (see maxHpEstimate), we show actual
+    // HP pools alongside the percentages.
+    const fmtAbs = (a, m) => (a != null && m != null) ? `${a.toLocaleString()}/${m.toLocaleString()}` : null;
+    const tag = (pct) => pct < 30 ? 'warn' : pct < 60 ? 'big' : '';
     if (d.hpBeforePct != null && d.hpAfterPct != null) {
-      const tag = d.hpAfterPct < 30 ? 'warn' : d.hpAfterPct < 60 ? 'big' : '';
-      rows.push(trow('HP', `<span class="${tag}">${d.hpBeforePct}% → ${d.hpAfterPct}%</span>`));
+      const absLine = (d.hpBefore != null && d.hpAfter != null && d.hpMax != null)
+        ? `${fmtAbs(d.hpBefore, d.hpMax)} → ${fmtAbs(d.hpAfter, d.hpMax)}`
+        : null;
+      if (absLine) {
+        rows.push(trow('HP', `<span class="${tag(d.hpAfterPct)}">${absLine}</span>`));
+        rows.push(trow('', `<span style="color:var(--parchment-faint);font-size:0.82em">(${d.hpBeforePct}% → ${d.hpAfterPct}%)</span>`));
+      } else {
+        rows.push(trow('HP', `<span class="${tag(d.hpAfterPct)}">${d.hpBeforePct}% → ${d.hpAfterPct}%</span>`));
+      }
     } else if (d.hpAfterPct != null) {
-      const tag = d.hpAfterPct < 30 ? 'warn' : d.hpAfterPct < 60 ? 'big' : '';
-      rows.push(trow('HP after', `<span class="${tag}">${d.hpAfterPct}%</span>`));
+      if (d.hpAfter != null && d.hpMax != null) {
+        rows.push(trow('HP after', `<span class="${tag(d.hpAfterPct)}">${fmtAbs(d.hpAfter, d.hpMax)}</span>`));
+        rows.push(trow('', `<span style="color:var(--parchment-faint);font-size:0.82em">(${d.hpAfterPct}%)</span>`));
+      } else {
+        rows.push(trow('HP after', `<span class="${tag(d.hpAfterPct)}">${d.hpAfterPct}%</span>`));
+      }
     }
     if (d.armor) rows.push(trow('Tank armor', d.armor.toLocaleString()));
+    if (d.hpMax && d.hpBefore != null) {
+      rows.push(`<div class="tt-meta">Tank max HP estimated from damage-event deltas.</div>`);
+    }
     return rows.join('');
   }
   function rowsForCast(c) {
