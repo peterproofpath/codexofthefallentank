@@ -20,21 +20,25 @@ their gear was appropriate for that boss. Built for TBC 2.4.3 / Karazhan
    - **Report code** — e.g., `w2aQqPTyMKbFRWgY`
    - **API key** — a Warcraft Logs V1 API key (persisted in `localStorage`)
    - **Player (tank)** — defaults to `Cassen`
-   - **Healer (reference)** — defaults to `Dharkon`
    - **Region** — defaults to `fresh` (Classic Fresh). Use `www` for retail, `classic` for era, `cata` for Cata Classic.
 3. Hit **Load Report**.
+
+No healer field — every landed heal on the tank is tracked regardless of
+source (Dharkon, Grudgar, Dharkon's Renew, a paladin's Judgement of Light
+proc, whatever).
 
 Per-fight cards render along a vertical spine. **Only fights where the
 tracked player actually died are shown** — this is a death analyzer, not a
 full raid dashboard. Each card includes a gear breakdown (with derived
 defense/crit-immunity numbers and a "swaps from previous fight" diff) plus
-a 10-second death timeline (damage taken, healer casts, Holy Shield
-uptime), and a written autopsy per death. Hover any damage tick, healer
-cast, or Holy Shield marker for a rich tooltip with hit type, mitigation,
-overkill, HP after hit, target, and segment duration.
+a 15-second death timeline with three lanes: damage taken, landed heals
+(all sources), and Holy Shield uptime. A written autopsy accompanies
+every death. Hover any damage tick, heal tick, or Holy Shield marker for
+a rich tooltip with hit type, mitigation, overkill, HP before/after,
+healer/source, heal amount + overheal, or segment duration.
 
 The timeline window is defined by a single constant (`TIMELINE_WINDOW_MS`
-at the top of the `<script>` block) — change it to 5000 or 15000 if you
+at the top of the `<script>` block) — change it to 5000 or 10000 if you
 want a different forensic window.
 
 ### Caching
@@ -84,10 +88,10 @@ All under `https://{region}.warcraftlogs.com/v1`. All require `?api_key=...`.
 | Endpoint                                                | Purpose                                                                 |
 |---------------------------------------------------------|-------------------------------------------------------------------------|
 | `/report/fights/{code}`                                 | Fight list, friendlies, enemies, fight windows.                         |
-| `/report/events/deaths/{code}?targetid=<playerId>`      | Player death events. `targetid` works here.                             |
+| `/report/events/deaths/{code}?filter=target.name="..."` | Player death events. `targetid` is unreliable here — use the filter form. |
 | `/report/events/damage-taken/{code}?filter=target.name="..."` | Damage events against the player. **`targetid` is broken on this endpoint** — use the `filter` form. |
-| `/report/events/casts/{code}?sourceid=<healerId>`       | Healer cast events in a window.                                         |
-| `/report/events/buffs/{code}?targetid=<playerId>&abilityid=20925` | Holy Shield buff events. Fetched once per rank (20925, 20927, 20928, 27179). |
+| `/report/events/healing/{code}?filter=target.name="..."` | All landed heals on the tank, from any source. `sourceID` identifies the healer per event. |
+| `/report/events/buffs/{code}?filter=target.name="..." and ability.name="Holy Shield"` | Holy Shield buff events across all ranks in a single call. |
 | `/report/tables/summary/{code}?start=X&end=Y`           | `playerDetails[role][i].combatantInfo.gear` array per fight, with item ID, iLvl, permanent enchant id+name, and gem ids. Called per fight. |
 
 Rate limit is 3,600 points/hour. A typical report fetch spends ~200-400
@@ -129,7 +133,8 @@ works:
   - Shadow Cleave for 4,791 at t≈-2.0s
   - Midnight knockdown at t≈-0.02s
   - Killing blow: Attumen Melee for 2,036 (1,899 overkill)
-  - Dharkon's Circle of Healing at t≈-4.4s, Renew on player at t≈-3.1s
+  - Heal ticks on the tank from whichever healers were triaging (hover
+    for source + effective/overheal)
   - Holy Shield lapsed at t≈-4.0s and was not refreshed (20% uptime)
 
 ## Stretch goals not implemented

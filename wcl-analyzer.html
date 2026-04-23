@@ -124,7 +124,7 @@ code, .mono { font-family: 'JetBrains Mono', Menlo, monospace; font-size: 0.92em
 
 .form-grid {
   display: grid;
-  grid-template-columns: 1.4fr 1.4fr 1fr 1fr 0.7fr auto;
+  grid-template-columns: 1.5fr 1.5fr 1fr 0.8fr auto;
   gap: 0.9rem 1rem;
   align-items: end;
 }
@@ -660,7 +660,6 @@ button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
     <label>Report code<input id="i-code" type="text" placeholder="w2aQqPTyMKbFRWgY" autocomplete="off"></label>
     <label>API key<input id="i-key" type="password" placeholder="V1 key" autocomplete="off"></label>
     <label>Player (tank)<input id="i-player" type="text" value="Cassen" autocomplete="off"></label>
-    <label>Healer (reference)<input id="i-healer" type="text" value="Dharkon" autocomplete="off"></label>
     <label>Region<select id="i-region">
       <option value="www">www (retail)</option>
       <option value="classic">classic</option>
@@ -1037,8 +1036,8 @@ const HIT_TYPE_NAME = {
 };
 
 function buildDeathTimelineSVG({
-  damageEvents, healerCasts, holyShieldEvents, healingReceived = [],
-  deathTime, playerId, playerName, healerName, nameMap, windowMs = 15000,
+  damageEvents, holyShieldEvents, healingReceived = [],
+  deathTime, playerId, playerName, nameMap, windowMs = 15000,
 }) {
   const W = 1100, H = 210;
   const PAD_L = 56, PAD_R = 20, PAD_T = 22, PAD_B = 38;
@@ -1124,7 +1123,7 @@ function buildDeathTimelineSVG({
   // Lane labels
   const laneLabels = [
     { y: PAD_T + laneH*0.5, text: 'DMG TAKEN' },
-    { y: PAD_T + laneH*1.5, text: 'HEALER CASTS' },
+    { y: PAD_T + laneH*1.5, text: 'HEALS ON TANK' },
     { y: PAD_T + laneH*2.5, text: 'HOLY SHIELD' },
   ];
   for (const lab of laneLabels) {
@@ -1179,63 +1178,42 @@ function buildDeathTimelineSVG({
     parts.push(`<rect x="${xv-6}" y="${dmgLaneTop}" width="12" height="${laneH}" fill="transparent" data-evt="${de(data)}"/>`);
   }
 
-  /* Lane 2 — healer casts ------------------------------------------------ */
-  // Match each cast on the tracked player against the landed healing
-  // events we already have (healingReceived is filtered to the tank). For
-  // HoTs we sum ticks up to the next re-cast of the same spell on the same
-  // target; for direct heals we only get one tick. Casts on OTHER targets
-  // have no amount to show — we only fetched heals on the tank.
-  const sortedCasts = healerCasts.slice().sort((a,b) => a.timestamp - b.timestamp);
-  function healingForCast(cast) {
-    const abilityName = cast.ability?.name;
-    const tgt = cast.targetID;
-    if (tgt !== playerId) return null;  // unknown target → no matching heals
-    // Cap the match window at the next cast of the same ability+target, so
-    // HoT ticks aren't double-counted across re-applications.
-    const next = sortedCasts.find(c =>
-      c.timestamp > cast.timestamp &&
-      c.ability?.name === abilityName &&
-      c.targetID === tgt
-    );
-    const winEnd = next ? next.timestamp : cast.timestamp + 22000;
-    const hits = healingReceived.filter(he =>
-      he.targetID === tgt &&
-      he.ability?.name === abilityName &&
-      he.timestamp >= cast.timestamp - 500 &&
-      he.timestamp <  winEnd
-    );
-    if (!hits.length) return { amount: 0, overheal: 0, ticks: 0, crit: false, missing: true };
-    let amount = 0, overheal = 0, crit = false;
-    for (const h of hits) {
-      amount += +(h.amount || 0);
-      overheal += +(h.overheal || 0);
-      if (h.hitType === 2) crit = true;
-    }
-    return { amount, overheal, ticks: hits.length, crit, missing: false };
+  /* Lane 2 — heals on tank (all sources) ------------------------------ */
+  // Every landed heal tick from any healer in the raid. Bar height scales
+  // with effective heal size so a Greater Heal stands out from a Renew
+  // tick. Crit heals get a brighter gold. Hover shows the specific source
+  // + ability + effective / overheal / total.
+  let maxHealAmt = 1;
+  for (const he of healingReceived) {
+    const amt = +(he.amount || 0);
+    if (amt > maxHealAmt) maxHealAmt = amt;
   }
-
   const healY = PAD_T + laneH + laneH/2;
   const healLaneTop = PAD_T + laneH;
-  for (const c of healerCasts) {
-    const ts = c.timestamp;
+  const healBaseline = PAD_T + 2*laneH;
+  for (const he of healingReceived) {
+    const ts = he.timestamp;
     if (ts < t0 || ts > deathTime) continue;
     const xv = x(ts);
-    const onPlayer = c.targetID === playerId;
-    const name = c.ability?.name || '?';
-    const h = laneH * 0.5;
-    const color = onPlayer ? '#fff4d0' : '#6a7a5a';
-    parts.push(`<line x1="${xv}" y1="${healY - h/2}" x2="${xv}" y2="${healY + h/2}" stroke="${color}" stroke-width="${onPlayer?3:2}" opacity="${onPlayer?1:0.55}" stroke-linecap="round"/>`);
-    if (onPlayer) {
-      parts.push(`<path d="M${xv},${healY-h/2-3} L${xv+2},${healY-h/2} L${xv},${healY-h/2+3} L${xv-2},${healY-h/2} Z" fill="${color}"/>`);
+    const amount = +(he.amount || 0);
+    const overheal = +(he.overheal || 0);
+    const isCrit = he.hitType === 2;
+    const h = Math.max(4, (amount / maxHealAmt) * (laneH - 10));
+    const color = isCrit ? '#ffe9a8' : '#fff4d0';
+    // Upward tick from baseline for heals (mirrors the downward dmg bars).
+    parts.push(`<rect x="${xv-2}" y="${healBaseline - h}" width="4" height="${h}" fill="${color}" opacity="0.92"/>`);
+    // Spark tip for crit heals.
+    if (isCrit) {
+      parts.push(`<path d="M${xv},${healBaseline-h-4} L${xv+2},${healBaseline-h-1} L${xv},${healBaseline-h+2} L${xv-2},${healBaseline-h-1} Z" fill="${color}"/>`);
     }
-    parts.push(`<text x="${xv}" y="${healY - h/2 - 6}" fill="${onPlayer?'#fff4d0':'#7a6f56'}" font-family="JetBrains Mono, monospace" font-size="8" text-anchor="middle">${escapeXML(name.slice(0,9))}</text>`);
-    const heal = healingForCast(c);
     const data = {
-      kind: 'cast',
-      name, t: +((ts - deathTime)/1000).toFixed(3),
-      source: healerName || nm(c.sourceID),
-      target: nm(c.targetID), onPlayer,
-      heal,
+      kind: 'heal',
+      name: he.ability?.name || 'Heal',
+      t: +((ts - deathTime)/1000).toFixed(3),
+      source: nm(he.sourceID),
+      amount, overheal,
+      total: amount + overheal,
+      crit: isCrit,
     };
     parts.push(`<rect x="${xv-6}" y="${healLaneTop}" width="12" height="${laneH}" fill="transparent" data-evt="${de(data)}"/>`);
   }
@@ -1324,7 +1302,7 @@ function escapeXML(s) {
 /* =========================================================================
  *  Autopsy text generator
  * ========================================================================= */
-function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvents, healerCasts, holyShieldEvents, healingReceived = [], playerId, windowMs = 15000 }) {
+function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvents, holyShieldEvents, healingReceived = [], playerId, nameMap, windowMs = 15000 }) {
   const window = windowMs;
   const windowSec = Math.round(window / 1000);
   const t0 = deathTime - window;
@@ -1342,15 +1320,14 @@ function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvent
   const dtps = (totalDmg / (window/1000)).toFixed(0);
 
   // Healer casts within window
-  const heals = healerCasts.filter(c => inWindow(c.timestamp));
-  const onPlayer = heals.filter(h => h.targetID === playerId);
-  const notOnPlayer = heals.filter(h => h.targetID !== playerId);
-  const directHeals = onPlayer.filter(h => /Flash Heal|Greater Heal|Binding Heal|Holy Light|Flash of Light|Nourish|Healing Touch/i.test(h.ability?.name || ''));
-  const lastDirectHeal = directHeals.length ? directHeals[directHeals.length - 1] : null;
-
-  // Healing received (all sources, not just tracked healer).
+  // Healing received (all sources, not just a tracked healer).
   const healsLanded = healingReceived.filter(h => inWindow(h.timestamp));
   const totalHealingEff = healsLanded.reduce((s,e) => s + (e.amount || 0), 0);
+  // "Direct" heals are landed heals with a meaningful amount (ignore
+  // micro-heals like HoT ticks < 100 when picking the "last direct heal").
+  const directHeals = healsLanded.filter(h => /Flash Heal|Greater Heal|Binding Heal|Holy Light|Flash of Light|Nourish|Healing Touch|Prayer of Healing|Chain Heal|Circle of Healing|Riptide|Lay on Hands/i.test(h.ability?.name || ''));
+  const lastDirectHeal = directHeals.length ? directHeals[directHeals.length - 1] : null;
+  const distinctHealers = new Set(healsLanded.map(h => nameMap?.get(h.sourceID) || `id ${h.sourceID}`));
 
   // Holy Shield uptime %
   const sorted = holyShieldEvents.slice().sort((a,b) => a.timestamp - b.timestamp);
@@ -1385,12 +1362,12 @@ function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvent
     if (last.overkill || last.timestamp >= deathTime - 500) killingBlow = last;
   }
 
-  // Gap analysis
-  const playerHealTs = [t0, ...onPlayer.map(h => h.timestamp), deathTime];
-  playerHealTs.sort((a,b) => a - b);
+  // Gap analysis — longest span without any heal landing on the tank.
+  const healTs = [t0, ...healsLanded.map(h => h.timestamp), deathTime];
+  healTs.sort((a,b) => a - b);
   let maxGap = 0;
-  for (let i = 1; i < playerHealTs.length; i++) {
-    const g = playerHealTs[i] - playerHealTs[i-1];
+  for (let i = 1; i < healTs.length; i++) {
+    const g = healTs[i] - healTs[i-1];
     if (g > maxGap) maxGap = g;
   }
 
@@ -1404,7 +1381,11 @@ function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvent
   parts.push(`Took <span class="num">${totalDmg.toLocaleString()}</span> damage in the final ${windowSec} seconds (<span class="num">${dtps}</span> DTPS)${totalAbsorb ? ` with <span class="num">${totalAbsorb.toLocaleString()}</span> absorbed` : ''}.`);
 
   if (totalHealingEff > 0) {
-    parts.push(`Received <span class="num">${totalHealingEff.toLocaleString()}</span> effective healing from all sources in the ${windowSec}s window.`);
+    const healerList = [...distinctHealers];
+    const healerPhrase = healerList.length === 0 ? ''
+                      : healerList.length <= 3 ? ` from ${healerList.join(', ')}`
+                      : ` from ${healerList.length} healers`;
+    parts.push(`Received <span class="num">${totalHealingEff.toLocaleString()}</span> effective healing${healerPhrase} in the ${windowSec}s window.`);
   } else {
     parts.push(`<span class="warn">No healing landed</span> on the tank in the ${windowSec}s window.`);
   }
@@ -1422,13 +1403,10 @@ function generateAutopsy({ fight, deathIndex, deathTime, fightStart, damageEvent
 
   if (lastDirectHeal) {
     const offs = ((lastDirectHeal.timestamp - deathTime) / 1000).toFixed(2);
-    parts.push(`Last direct heal on player: <span class="num">${lastDirectHeal.ability?.name || '?'}</span> at t${offs}s.`);
-  } else if (onPlayer.length) {
-    parts.push(`Healer cast <span class="num">${onPlayer.length}</span> spell${onPlayer.length===1?'':'s'} on the player but <span class="warn">no direct heal</span> (Flash Heal, Greater Heal, etc.) in the window.`);
-  } else if (notOnPlayer.length) {
-    parts.push(`<span class="warn">Healer cast no spells on the player</span> in the death window — ${notOnPlayer.length} cast${notOnPlayer.length===1?'':'s'} went to other targets.`);
-  } else {
-    parts.push(`<span class="warn">No healer activity</span> from the tracked healer during this ${windowSec}s window.`);
+    const src = nameMap?.get(lastDirectHeal.sourceID) || 'a healer';
+    parts.push(`Last direct heal: <span class="num">${lastDirectHeal.ability?.name || '?'}</span> from ${src} at t${offs}s for <span class="num">${(lastDirectHeal.amount || 0).toLocaleString()}</span>.`);
+  } else if (healsLanded.length) {
+    parts.push(`<span class="warn">No direct heal</span> (Flash Heal, Greater Heal, etc.) landed in the window — only HoT ticks or small instant heals.`);
   }
 
   if (killingBlow) {
@@ -1702,13 +1680,11 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
   const wrap = el('div', { className: 'timeline-wrap' });
   wrap.innerHTML = buildDeathTimelineSVG({
     damageEvents: death.damageEvents,
-    healerCasts: death.healerCasts,
     holyShieldEvents: death.holyShieldEvents,
     healingReceived: death.healingReceived || [],
     deathTime: death.deathTime,
     playerId,
     playerName: ctx.playerName,
-    healerName: ctx.healerName,
     nameMap: ctx.nameMap,
     windowMs: TIMELINE_WINDOW_MS,
   });
@@ -1716,10 +1692,10 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
 
   block.appendChild(el('div', { className: 'timeline-legend' }, [
     el('span', {}, [el('span', { className: 'dot', style: 'background:#a8202a' }), 'damage']),
-    el('span', {}, [el('span', { className: 'dot', style: 'background:#e74c5c' }), 'crit']),
+    el('span', {}, [el('span', { className: 'dot', style: 'background:#e74c5c' }), 'crit/crush']),
     el('span', {}, [el('span', { className: 'dot', style: 'background:#6a5a3a' }), 'absorbed']),
-    el('span', {}, [el('span', { className: 'dot', style: 'background:#fff4d0' }), 'heal on player']),
-    el('span', {}, [el('span', { className: 'dot', style: 'background:#6a7a5a' }), 'heal on other']),
+    el('span', {}, [el('span', { className: 'dot', style: 'background:#fff4d0' }), 'heal landed']),
+    el('span', {}, [el('span', { className: 'dot', style: 'background:#ffe9a8' }), 'crit heal']),
     el('span', {}, [el('span', { className: 'dot', style: 'background:linear-gradient(180deg,#fff4d0,#8a6a1f)' }), 'Holy Shield up']),
   ]));
 
@@ -1729,13 +1705,13 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
   const totalDmg = death.damageEvents.filter(e => e.timestamp >= t0 && e.timestamp <= death.deathTime).reduce((s,e) => s + (e.amount || 0), 0);
   const totalAbs = death.damageEvents.filter(e => e.timestamp >= t0 && e.timestamp <= death.deathTime).reduce((s,e) => s + (e.absorbed || 0), 0);
   const dtps = (totalDmg / (win/1000)).toFixed(0);
-  const healsOnPlayer = death.healerCasts.filter(c => c.timestamp >= t0 && c.timestamp <= death.deathTime && c.targetID === playerId);
   // Healing received (all sources). `amount` is the post-overheal effective
   // heal. `overheal` is dropped HP.
   const healingEvs = (death.healingReceived || []).filter(e => e.timestamp >= t0 && e.timestamp <= death.deathTime);
   const totalHealingEff = healingEvs.reduce((s,e) => s + (e.amount || 0), 0);
   const totalOverheal    = healingEvs.reduce((s,e) => s + (e.overheal || 0), 0);
   const hps = (totalHealingEff / (win/1000)).toFixed(0);
+  const distinctHealers = new Set(healingEvs.map(e => e.sourceID)).size;
   // Compute HS uptime ms
   const hsEv = death.holyShieldEvents.slice().sort((a,b) => a.timestamp - b.timestamp);
   let active = null, hsUp = 0;
@@ -1746,12 +1722,12 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
     else if (e.type === 'removebuff' && active !== null) { hsUp += (t - active); active = null; }
   }
   if (active !== null) hsUp += (death.deathTime - active);
-  // Longest gap without heal on player
-  const ts = [t0, ...healsOnPlayer.map(h => h.timestamp), death.deathTime];
-  ts.sort((a,b) => a-b);
+  // Longest gap without any heal landing on the tank
+  const healTs = [t0, ...healingEvs.map(h => h.timestamp), death.deathTime];
+  healTs.sort((a,b) => a-b);
   let maxHealGap = 0;
-  for (let i = 1; i < ts.length; i++) {
-    const g = ts[i] - ts[i-1];
+  for (let i = 1; i < healTs.length; i++) {
+    const g = healTs[i] - healTs[i-1];
     if (g > maxHealGap) maxHealGap = g;
   }
 
@@ -1763,7 +1739,7 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
     el('div', {}, [el('span', { className: 'k' }, ['HPS received ']), el('br'), el('span', { className: 'v' }, [hps])]),
     el('div', {}, [el('span', { className: 'k' }, ['Absorbed ']), el('br'), el('span', { className: 'v' }, [totalAbs.toLocaleString()])]),
     el('div', {}, [el('span', { className: 'k' }, ['Overheal ']), el('br'), el('span', { className: 'v' }, [totalOverheal.toLocaleString()])]),
-    el('div', {}, [el('span', { className: 'k' }, [`Heal casts on player (${winSec}s) `]), el('br'), el('span', { className: 'v' + (healsOnPlayer.length ? '' : ' warn') }, [healsOnPlayer.length.toString()])]),
+    el('div', {}, [el('span', { className: 'k' }, [`Heal ticks / healers `]), el('br'), el('span', { className: 'v' + (healingEvs.length ? '' : ' warn') }, [`${healingEvs.length} / ${distinctHealers}`])]),
     el('div', {}, [el('span', { className: 'k' }, ['Holy Shield uptime ']), el('br'), el('span', { className: 'v' + (hsUp/win < 0.6 ? ' warn' : '') }, [`${Math.round(hsUp/win*100)}%`])]),
     el('div', {}, [el('span', { className: 'k' }, ['Longest heal gap ']), el('br'), el('span', { className: 'v' + (maxHealGap > 3000 ? ' warn' : '') }, [`${(maxHealGap/1000).toFixed(1)}s`])]),
   ]);
@@ -1777,10 +1753,10 @@ function renderDeathBlock(fight, death, idx, playerId, totalDeaths, ctx = {}) {
     deathTime: death.deathTime,
     fightStart: fight.start_time,
     damageEvents: death.damageEvents,
-    healerCasts: death.healerCasts,
     holyShieldEvents: death.holyShieldEvents,
     healingReceived: death.healingReceived || [],
     playerId,
+    nameMap: ctx.nameMap,
     windowMs: win,
   });
   block.appendChild(autopsy);
@@ -1831,7 +1807,7 @@ function renderFightCard(fight, gearResult, prevGear, deaths, playerId, ctx = {}
 
 const HOLY_SHIELD_ABILITY_IDS = [20925, 20927, 20928, 27179];  // ranks 1-4
 
-async function analyze({ region, code, key, playerName, healerName, progress }) {
+async function analyze({ region, code, key, playerName, progress }) {
   const log = (m) => { progress.textContent = m; };
   const errLog = (m) => { progress.textContent = m; progress.classList.add('error'); };
 
@@ -1841,9 +1817,7 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
   currentReport = fightsJson;
 
   const player = fightsJson.friendlies.find(f => f.name.toLowerCase() === playerName.toLowerCase());
-  const healer = fightsJson.friendlies.find(f => f.name.toLowerCase() === healerName.toLowerCase());
   if (!player) throw new Error(`Player "${playerName}" not found in report. Friendlies: ${fightsJson.friendlies.map(f=>f.name).join(', ').slice(0,300)}…`);
-  if (!healer) throw new Error(`Healer "${healerName}" not found in report.`);
 
   // All fights containing player
   const playerFightIds = new Set((player.fights || []).map(f => f.id));
@@ -1893,7 +1867,6 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
   const tasks = [];
   const fightGear = new Map();      // fightId → gear[]
   const fightDamage = new Map();    // fightId → event[]
-  const fightCasts = new Map();     // fightId → event[]  (tracked healer's casts)
   const fightHealing = new Map();   // fightId → event[]  (landed heals on tank, ALL sources)
   const fightBuffs = new Map();     // fightId → event[]
 
@@ -1916,14 +1889,8 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
       });
       fightDamage.set(f.id, (j.events || []).filter(e => e.targetID === player.id));
     });
-    tasks.push(async () => {
-      const j = await wclFetchAllPages(region, code, `events/casts/${code}`, {
-        start, end, sourceid: healer.id, api_key: key,
-      });
-      fightCasts.set(f.id, j.events || []);
-    });
-    // Landed heals on the tank from ANY source — for "total healing received"
-    // and for building an HP trail that includes heal ticks, not just damage.
+    // All landed heals on the tank — sourceID identifies the healer, so the
+    // heal lane becomes source-agnostic (all raid healers, not just one).
     tasks.push(async () => {
       const j = await wclFetchAllPages(region, code, `events/healing/${code}`, {
         start, end, filter: targetNameFilter, api_key: key,
@@ -1955,7 +1922,6 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
     const t0 = d.timestamp - windowMs;
     const t1 = d.timestamp;
     const dmg = (fightDamage.get(f.id) || []).filter(e => e.timestamp >= t0 && e.timestamp <= t1);
-    const casts = (fightCasts.get(f.id) || []).filter(e => e.timestamp >= t0 && e.timestamp <= t1);
     const heals = (fightHealing.get(f.id) || []).filter(e => e.timestamp >= t0 && e.timestamp <= t1);
     // For HS we also want the "buff was already active before the window"
     // signal, so include events up to deathTime — the drawing logic handles
@@ -1965,7 +1931,6 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
       deathTime: d.timestamp,
       fightId: f.id,
       damageEvents: dmg,
-      healerCasts: casts,
       healingReceived: heals,
       holyShieldEvents: buffs,
     };
@@ -1986,7 +1951,7 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
 
   log('Rendering…');
   progress.classList.remove('error');
-  return { fightsJson, player, healer, fightData };
+  return { fightsJson, player, fightData };
 }
 
 /* =========================================================================
@@ -2001,7 +1966,6 @@ function loadForm() {
     if (s.code) $('#i-code').value = s.code;
     if (s.key) $('#i-key').value = s.key;
     if (s.player) $('#i-player').value = s.player;
-    if (s.healer) $('#i-healer').value = s.healer;
     if (s.region) $('#i-region').value = s.region;
   } catch {}
 }
@@ -2010,7 +1974,6 @@ function saveForm() {
     code: $('#i-code').value.trim(),
     key:  $('#i-key').value.trim(),
     player: $('#i-player').value.trim(),
-    healer: $('#i-healer').value.trim(),
     region: $('#i-region').value,
   };
   localStorage.setItem('wcl-form', JSON.stringify(s));
@@ -2022,10 +1985,9 @@ async function run() {
   const code = $('#i-code').value.trim();
   const key = $('#i-key').value.trim();
   const playerName = $('#i-player').value.trim();
-  const healerName = $('#i-healer').value.trim();
 
-  if (!code || !key || !playerName || !healerName) {
-    $('#progress').textContent = 'Fill in all fields.';
+  if (!code || !key || !playerName) {
+    $('#progress').textContent = 'Fill in report code, API key, and player name.';
     $('#progress').classList.add('error');
     return;
   }
@@ -2036,7 +1998,7 @@ async function run() {
 
   try {
     const out = await analyze({
-      region, code, key, playerName, healerName,
+      region, code, key, playerName,
       progress: $('#progress'),
     });
     renderResults(out);
@@ -2059,12 +2021,12 @@ function buildNameMap(fightsJson) {
   return m;
 }
 
-function renderResults({ fightsJson, player, healer, fightData }) {
+function renderResults({ fightsJson, player, fightData }) {
   const results = $('#results');
   results.innerHTML = '';
 
   const nameMap = buildNameMap(fightsJson);
-  const ctx = { nameMap, playerName: player.name, healerName: healer.name };
+  const ctx = { nameMap, playerName: player.name };
 
   // Header
   const start = new Date(fightsJson.start);
@@ -2073,8 +2035,8 @@ function renderResults({ fightsJson, player, healer, fightData }) {
   const meta = [];
   meta.push(new Date(fightsJson.start).toLocaleString());
   if (fightsJson.owner) meta.push(`uploaded by ${fightsJson.owner}`);
-  meta.push(`${fightData.length} fights analyzed`);
-  meta.push(`${player.name} (Paladin tank) vs ${healer.name} (healer)`);
+  meta.push(`${fightData.length} fights with ${player.name} deaths`);
+  meta.push(`${player.name} (Paladin tank)`);
   header.appendChild(el('div', { className: 'meta' }, [meta.join(' · ')]));
 
   const toc = el('div', { className: 'fight-toc' });
@@ -2173,33 +2135,19 @@ function initTooltip() {
     }
     return rows.join('');
   }
-  function rowsForCast(c) {
+  function rowsForHeal(h) {
     const rows = [];
-    const titleBadge = c.heal?.crit ? ` <span class="tt-hit-pill crit">CRIT</span>` : '';
-    rows.push(`<div class="tt-title">${escapeHTML(c.name)}${titleBadge}</div>`);
-    const sign = c.t > 0 ? '+' : '';
-    rows.push(trow('Time', `${sign}${c.t.toFixed(2)}s before death`));
-    rows.push(trow('Source', escapeHTML(c.source || '—')));
-    rows.push(trow('Target', `<span class="${c.onPlayer ? 'heal' : ''}">${escapeHTML(c.target)}</span>`));
-
-    // Heal amount (only known when target is the tracked tank).
-    if (c.onPlayer && c.heal) {
-      if (c.heal.missing) {
-        rows.push(trow('Healed for', `<span class="miss">— nothing landed —</span>`));
-      } else {
-        const eff = c.heal.amount, ov = c.heal.overheal, tot = eff + ov;
-        const tickLabel = c.heal.ticks > 1 ? ` (${c.heal.ticks} ticks)` : '';
-        rows.push(trow('Healed for', `<span class="heal">${eff.toLocaleString()}</span>${tickLabel}`));
-        if (ov > 0) {
-          const pct = tot > 0 ? Math.round(ov / tot * 100) : 0;
-          rows.push(trow('Overheal', `<span class="warn">${ov.toLocaleString()} (${pct}%)</span>`));
-          rows.push(trow('Total (raw)', tot.toLocaleString()));
-        }
-      }
+    const titleBadge = h.crit ? ` <span class="tt-hit-pill crit">CRIT</span>` : '';
+    rows.push(`<div class="tt-title">${escapeHTML(h.name)}${titleBadge}</div>`);
+    const sign = h.t > 0 ? '+' : '';
+    rows.push(trow('Time', `${sign}${h.t.toFixed(2)}s before death`));
+    rows.push(trow('Healer', escapeHTML(h.source || '—')));
+    rows.push(trow('Healed for', `<span class="heal">${h.amount.toLocaleString()}</span>`));
+    if (h.overheal > 0) {
+      const pct = h.total > 0 ? Math.round(h.overheal / h.total * 100) : 0;
+      rows.push(trow('Overheal', `<span class="warn">${h.overheal.toLocaleString()} (${pct}%)</span>`));
+      rows.push(trow('Total (raw)', h.total.toLocaleString()));
     }
-
-    if (c.onPlayer) rows.push(`<div class="tt-meta">Landed on the tracked tank.</div>`);
-    else rows.push(`<div class="tt-meta">Went to another target — heal amount not tracked here.</div>`);
     return rows.join('');
   }
   function rowsForHsMarker(m) {
@@ -2232,7 +2180,7 @@ function initTooltip() {
 
   function render(data) {
     if (data.kind === 'damage')      return rowsForDamage(data);
-    if (data.kind === 'cast')        return rowsForCast(data);
+    if (data.kind === 'heal')        return rowsForHeal(data);
     if (data.kind === 'hs-marker')   return rowsForHsMarker(data);
     if (data.kind === 'hs-segment')  return rowsForHsSegment(data);
     return `<div class="tt-title">Unknown</div>`;
