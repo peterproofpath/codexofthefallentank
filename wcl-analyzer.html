@@ -687,7 +687,10 @@ function apiBase(region) { return `https://${region}.warcraftlogs.com/v1`; }
 const netCache = new Map();
 let currentReport = null;
 
-function cacheKey(region, code) { return `wcl-cache:${region}:${code}`; }
+// Bumped to v2 when the fetch strategy switched from per-death to per-fight
+// batching. Old v1 caches may contain empty responses from pre-fix 429
+// handling; abandoning them forces a clean re-fetch.
+function cacheKey(region, code) { return `wcl-cache-v2:${region}:${code}`; }
 
 function loadCache(region, code) {
   try {
@@ -712,7 +715,7 @@ async function wclFetch(region, code, endpoint, params, onRetry) {
 
   const url = `${apiBase(region)}/report/${endpoint}?${qs}`;
   let delay = 1500;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     const r = await fetch(url);
     // WCL returns 429 either as HTTP status OR as HTTP 200 with {status:429,error}
     // in the JSON body — handle both.
@@ -740,6 +743,39 @@ async function wclFetch(region, code, endpoint, params, onRetry) {
     return j;
   }
   throw new Error(`Rate limited on ${endpoint} after retries — wait a minute and retry.`);
+}
+
+// Follow `nextPageTimestamp` until the server reports no more pages.
+// Result shape: { events: [...all events across pages...] }.
+// Cached per-page by wclFetch, so re-running only re-requests pages that
+// weren't already in-flight.
+async function wclFetchAllPages(region, code, endpoint, params, onRetry) {
+  const collected = [];
+  let page = { ...params };
+  for (let i = 0; i < 20; i++) {  // hard cap against runaway paging
+    const resp = await wclFetch(region, code, endpoint, page, onRetry);
+    if (Array.isArray(resp.events)) collected.push(...resp.events);
+    if (!resp.nextPageTimestamp) return { ...resp, events: collected };
+    page = { ...page, start: resp.nextPageTimestamp };
+  }
+  console.warn(`wclFetchAllPages: hit 20-page cap on ${endpoint}`);
+  return { events: collected };
+}
+
+// Concurrency-limited Promise.all. Keeps at most `n` fetches in flight so
+// we don't trip WCL's per-IP limiter with a huge parallel fan-out.
+async function runWithLimit(tasks, n = 4) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();
+    }
+  }
+  const workers = Array.from({ length: Math.min(n, tasks.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 /* =========================================================================
@@ -1619,71 +1655,94 @@ async function analyze({ region, code, key, playerName, healerName, progress }) 
 
   log(`Analyzing ${fightsToRender.length} fight${fightsToRender.length===1?'':'s'} with deaths…`);
 
-  // Fetch per-fight summary (gear) for each fight — in parallel
-  const summaryPromises = fightsToRender.map(f => wclFetch(region, code, `tables/summary/${code}`, {
-    start: f.start_time, end: f.end_time, api_key: key,
-  }).then(j => ({ fightId: f.id, summary: j })));
-
-  // Fetch per-death windows (damage-taken, healer casts, holy shield buffs) in parallel.
-  // WCL V1 `targetid` param is unreliable on damage-taken (silently returns 0
-  // events). We use `filter=target.name="…"` instead, then belt-and-braces
-  // post-filter client-side on targetID.
-  log(`Fetching death windows (${allDeaths.length} deaths)…`);
+  // ---------- Batched fetches ---------------------------------------------
+  // Old strategy fired per-death calls — ~6 requests × deaths = quota burner.
+  // New strategy: one damage-taken call, one casts call, and one buffs call
+  // per FIGHT (not per death). Holy Shield buffs match all ranks via
+  // `ability.name="Holy Shield"`. Then we slice client-side to per-death
+  // windows. A 49-death report drops from ~295 calls to ~14×3 = 42 calls
+  // (plus gear summaries).
   const windowMs = TIMELINE_WINDOW_MS;
   const targetNameFilter = `target.name="${player.name}"`;
-  const deathWindowPromises = allDeaths.map(d => {
-    const start = d.timestamp - windowMs;
-    const end = d.timestamp;
-    return Promise.all([
-      wclFetch(region, code, `events/damage-taken/${code}`, {
+  const hsBuffFilter = `target.name="${player.name}" and ability.name="Holy Shield"`;
+
+  const tasks = [];
+  const fightGear = new Map();      // fightId → gear[]
+  const fightDamage = new Map();    // fightId → event[]
+  const fightCasts = new Map();     // fightId → event[]
+  const fightBuffs = new Map();     // fightId → event[]
+
+  for (const f of fightsToRender) {
+    const start = f.start_time, end = f.end_time;
+    tasks.push(async () => {
+      const j = await wclFetch(region, code, `tables/summary/${code}`, { start, end, api_key: key });
+      let gear = [];
+      if (j.playerDetails) {
+        for (const role of ['tanks','healers','dps']) {
+          const p = (j.playerDetails[role] || []).find(pp => pp.name === player.name);
+          if (p) { gear = p.combatantInfo?.gear || []; break; }
+        }
+      }
+      fightGear.set(f.id, gear);
+    });
+    tasks.push(async () => {
+      const j = await wclFetchAllPages(region, code, `events/damage-taken/${code}`, {
         start, end, filter: targetNameFilter, api_key: key,
-      }),
-      wclFetch(region, code, `events/casts/${code}`, {
+      });
+      fightDamage.set(f.id, (j.events || []).filter(e => e.targetID === player.id));
+    });
+    tasks.push(async () => {
+      const j = await wclFetchAllPages(region, code, `events/casts/${code}`, {
         start, end, sourceid: healer.id, api_key: key,
-      }),
-      // Fetch all 4 ranks of Holy Shield — most reports only have one relevant
-      Promise.all(HOLY_SHIELD_ABILITY_IDS.map(id =>
-        wclFetch(region, code, `events/buffs/${code}`, {
-          start, end, targetid: player.id, abilityid: id, api_key: key,
-        }).catch(() => ({ events: [] }))
-      )).then(results => ({ events: results.flatMap(r => r.events || []) })),
-    ]).then(([dmg, casts, buffs]) => ({
-      deathTime: d.timestamp,
-      fightId: (fightsJson.fights.find(f => f.start_time <= d.timestamp && d.timestamp <= f.end_time) || {}).id,
-      damageEvents: (dmg.events || []).filter(e => e.targetID === player.id),
-      healerCasts: casts.events || [],
-      holyShieldEvents: buffs.events || [],
-    }));
-  });
+      });
+      fightCasts.set(f.id, j.events || []);
+    });
+    tasks.push(async () => {
+      const j = await wclFetchAllPages(region, code, `events/buffs/${code}`, {
+        start, end, filter: hsBuffFilter, api_key: key,
+      });
+      // Belt-and-braces: if the compound filter ignored the ability clause,
+      // the server may have returned every buff change on the target. Keep
+      // only Holy Shield here so the timeline is never confused.
+      fightBuffs.set(f.id, (j.events || []).filter(e => {
+        const n = e.ability?.name || '';
+        return n === 'Holy Shield' || n.startsWith('Holy Shield');
+      }));
+    });
+  }
 
-  const [summaries, deathWindows] = await Promise.all([
-    Promise.all(summaryPromises),
-    Promise.all(deathWindowPromises),
-  ]);
+  log(`Fetching ${tasks.length} batched queries across ${fightsToRender.length} fights (≤4 concurrent)…`);
+  await runWithLimit(tasks, 4);
 
-  // Group deaths per fight
+  // Slice the fight-wide event arrays into per-death windows.
   const deathsByFight = new Map();
-  for (const w of deathWindows) {
-    if (!w.fightId) continue;
-    if (!deathsByFight.has(w.fightId)) deathsByFight.set(w.fightId, []);
-    deathsByFight.get(w.fightId).push(w);
+  for (const d of allDeaths) {
+    const f = fightsJson.fights.find(ff => ff.start_time <= d.timestamp && d.timestamp <= ff.end_time);
+    if (!f || !fightsToRender.find(fr => fr.id === f.id)) continue;
+    const t0 = d.timestamp - windowMs;
+    const t1 = d.timestamp;
+    const dmg = (fightDamage.get(f.id) || []).filter(e => e.timestamp >= t0 && e.timestamp <= t1);
+    const casts = (fightCasts.get(f.id) || []).filter(e => e.timestamp >= t0 && e.timestamp <= t1);
+    // For HS we also want the "buff was already active before the window"
+    // signal, so include events up to deathTime — the drawing logic handles
+    // the clipping.
+    const buffs = (fightBuffs.get(f.id) || []).filter(e => e.timestamp <= t1);
+    const entry = {
+      deathTime: d.timestamp,
+      fightId: f.id,
+      damageEvents: dmg,
+      healerCasts: casts,
+      holyShieldEvents: buffs,
+    };
+    if (!deathsByFight.has(f.id)) deathsByFight.set(f.id, []);
+    deathsByFight.get(f.id).push(entry);
   }
   for (const arr of deathsByFight.values()) arr.sort((a,b) => a.deathTime - b.deathTime);
 
-  // Build per-fight data
-  const summaryById = new Map(summaries.map(s => [s.fightId, s.summary]));
+  // Build per-fight data. Gear was resolved in the batched summary task
+  // above; deaths were sliced from the fight-wide event arrays.
   const fightData = fightsToRender.map(f => {
-    const summ = summaryById.get(f.id);
-    let gear = [];
-    if (summ?.playerDetails) {
-      for (const role of ['tanks','healers','dps']) {
-        const p = (summ.playerDetails[role] || []).find(pp => pp.name === playerName);
-        if (p) {
-          gear = p.combatantInfo?.gear || [];
-          break;
-        }
-      }
-    }
+    const gear = fightGear.get(f.id) || [];
     f.gear = gear;
     return { fight: f, gear, deaths: deathsByFight.get(f.id) || [] };
   });
